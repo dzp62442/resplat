@@ -9,6 +9,7 @@
     &middot;
     <a href="https://people.inf.ethz.ch/marc.pollefeys/">Marc Pollefeys</a>
   </p>
+  <h3 align="center">ECCV 2026 Oral</h3>
   <h3 align="center">
     <a href="https://arxiv.org/abs/2510.08575">Paper</a> | <a href="https://haofeixu.github.io/resplat/">Project Page</a> | <a href="MODEL_ZOO.md">Models</a>
   </h3>
@@ -102,12 +103,12 @@ Before training, you need to download the pre-trained [depth model](MODEL_ZOO.md
 If you find this work useful, please consider citing:
 
 ```bibtex
-@article{xu2025resplat,
-  title={ReSplat: Learning Recurrent Gaussian Splatting},
-  author={Xu, Haofei and Barath, Daniel and Geiger, Andreas and Pollefeys, Marc},
-  journal={arXiv preprint arXiv:2510.08575},
-  year={2025}
-}
+@inproceedings{xu2026resplat,
+      title={ReSplat: Learning Recurrent Gaussian Splatting},
+      author={Xu, Haofei and Barath, Daniel and Geiger, Andreas and Pollefeys, Marc},
+      booktitle={ECCV},
+      year={2026}
+    }
 ```
 
 ## Acknowledgements
