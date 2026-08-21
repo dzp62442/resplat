@@ -9,7 +9,7 @@
     &middot;
     <a href="https://people.inf.ethz.ch/marc.pollefeys/">Marc Pollefeys</a>
   </p>
-  <h3 align="center">ECCV 2026 Oral</h3>
+  <h3 align="center">ECCV 2026 Spotlight</h3>
   <h3 align="center">
     <a href="https://arxiv.org/abs/2510.08575">Paper</a> | <a href="https://haofeixu.github.io/resplat/">Project Page</a> | <a href="MODEL_ZOO.md">Models</a>
   </h3>
