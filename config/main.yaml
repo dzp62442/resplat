@@ -7,7 +7,7 @@ defaults:
 
 wandb:
   project: resplat
-  entity: null
+  entity: dzp62442-DROPS
   name: placeholder
   mode: online
   id: null
