@@ -58,12 +58,19 @@ class LossLpips(Loss[LossLpipsCfg, LossLpipsCfgWrapper]):
         if global_step < self.cfg.apply_after_step:
             return torch.tensor(0, dtype=torch.float32, device=image.device)
         
-        if valid_depth_mask is not None and valid_depth_mask.max() > 0.5:
-            prediction.color[valid_depth_mask] = 0
-            image[valid_depth_mask] = 0
+        predicted_image = prediction.color
+        if valid_depth_mask is not None:
+            if valid_depth_mask.shape != predicted_image.shape:
+                raise ValueError(
+                    "LPIPS mask/image shape mismatch: "
+                    f"mask={tuple(valid_depth_mask.shape)}, "
+                    f"image={tuple(predicted_image.shape)}"
+                )
+            predicted_image = predicted_image.masked_fill(valid_depth_mask, 0)
+            image = image.masked_fill(valid_depth_mask, 0)
 
         if self.cfg.perceptual_loss:
-            pred = rearrange(prediction.color, "b v c h w -> (b v) c h w")
+            pred = rearrange(predicted_image, "b v c h w -> (b v) c h w")
             gt = rearrange(image, "b v c h w -> (b v) c h w")
 
             if half_res_lpips:
@@ -80,7 +87,7 @@ class LossLpips(Loss[LossLpipsCfg, LossLpipsCfgWrapper]):
             )
         else:
             loss = self.lpips.forward(
-                rearrange(prediction.color, "b v c h w -> (b v) c h w"),
+                rearrange(predicted_image, "b v c h w -> (b v) c h w"),
                 rearrange(image, "b v c h w -> (b v) c h w"),
                 normalize=True,
             )

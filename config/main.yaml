@@ -74,6 +74,7 @@ train:
   loss_on_input_views: false
   train_window_size: null
   half_res_lpips_loss: false
+  use_dynamic_mask: false
 
 test:
   output_path: outputs/test

@@ -1,6 +1,6 @@
-# OmniScene 数据集实验说明（实施方案）
+# OmniScene 数据集实验说明
 
-> 本文档只描述 `comp_svfgs` 分支上的拟实现方案，当前阶段不修改训练、数据加载或评测代码。方案以 DepthSplat `comp_svfgs` 分支的 OmniScene 实现为数据侧参考，以 ReSplat `main` 分支的 RE10K 实验为模型与训练侧参考。
+> 本文档描述 `comp_svfgs` 分支上已经完成的 OmniScene 适配。实现以 DepthSplat `comp_svfgs` 分支的 OmniScene 数据侧为参考，以 ReSplat `main` 分支的 RE10K 模型与训练设置为基础；两阶段拓扑仅针对已验证的上游 checkpoint 尺寸冲突做兼容修正。
 
 ## 目标与实验口径
 
@@ -21,13 +21,13 @@
 | --- | --- | --- |
 | 100k 是否为此前约定的两阶段总和 | 是 | Init `66_667` + Refine `33_334` = `100_001`，不是两个阶段各训练 100k。 |
 | 是否从头训练 | 是，按前馈 baseline 的通常含义 | 不加载作者发布的 ReSplat/RE10K 完整模型；Init 从随机初始化的任务模型开始，只加载 ReSplat 方法原生依赖的 GMDepth/预训练 depth backbone；Refine 只加载本分辨率、本次 OmniScene Init 产生的 checkpoint。 |
-| 训练损失是否使用动态物体掩码 | 实施后必须是 | `train.use_dynamic_mask=true`；只用静态有效像素计算/构造 Init、intermediate 和每轮 Refine 的 target MSE/LPIPS，动态区域不参与训练监督。 |
+| 训练损失是否使用动态物体掩码 | 是 | `train.use_dynamic_mask=true`；只用静态有效像素计算/构造 Init、intermediate 和每轮 Refine 的 target MSE/LPIPS，动态区域不参与训练监督。 |
 
-当前文档仍处于实施方案阶段：现有 ReSplat 代码尚未完成这项接入，`training_step` 中的 `valid_depth_mask` 当前仍固定为 `None`。后续实现的验收标准不是“配置里出现开关”，而是该 mask 实际传入所有 target loss 分支并经过数值测试。
+实现不只增加了配置开关：动态 mask 已实际传入所有 target loss 分支，并通过数值测试验证；input-view supervision 不复用 18-view target mask。
 
 ## 配置概览
 
-### 计划新增的配置与脚本
+### 已新增的配置与脚本
 
 1. `config/dataset/omniscene.yaml`：OmniScene 数据集基础配置。
 2. `config/dataset/view_sampler/all.yaml`：注册 `all` sampler；OmniScene 自己确定固定的 6 个 context 和 18 个 target，sampler 主要用于保持现有配置接口完整。
@@ -43,7 +43,7 @@ Hydra 的加载顺序保持不变：先加载 `config/main.yaml`，再由 `+expe
 
 ### 数据集基础配置
 
-`config/dataset/omniscene.yaml` 计划采用以下核心值：
+`config/dataset/omniscene.yaml` 采用以下核心值：
 
 ```yaml
 defaults:
@@ -64,7 +64,7 @@ augment: false
 test_split: total
 ```
 
-DepthSplat 的 OmniScene YAML 虽写有 `augment: true`，但其 `DatasetOmniScene.__getitem__` 实际没有调用 augmentation shim。这里计划显式设为 `false`，使配置值与被复用的真实数据行为一致，避免出现“配置显示已增强、运行时却未增强”的死配置。
+DepthSplat 的 OmniScene YAML 虽写有 `augment: true`，但其 `DatasetOmniScene.__getitem__` 实际没有调用 augmentation shim。这里显式设为 `false`，使配置值与被复用的真实数据行为一致，避免出现“配置显示已增强、运行时却未增强”的死配置。
 
 其中 `test_split` 明确支持：
 
@@ -122,10 +122,10 @@ ReSplat 原始 `config/experiment/re10k.yaml` 用 `trainer.max_steps=300_001` �
 | --- | ---: | ---: |
 | `trainer.max_steps` | `66_667` | `33_334` |
 | `model.encoder.num_refine` | `0` | `2` |
-| `model.encoder.latent_downsample` | `4`（默认） | `2` |
-| `model.encoder.fixed_latent_size` | `true`（默认） | `false` |
-| `model.encoder.init_gaussian_multiple` | `16` | `4` |
-| `model.encoder.refine_same_num_points` | `false`（默认） | `true` |
+| `model.encoder.latent_downsample` | `2` | `2` |
+| `model.encoder.fixed_latent_size` | `false` | `false` |
+| `model.encoder.init_gaussian_multiple` | `4` | `4` |
+| `model.encoder.refine_same_num_points` | `true` | `true` |
 | 基础权重来源 | 官方 ReSplat depth base 预训练权重 | 本分辨率 Init 阶段 checkpoint |
 | 可训练参数 | Init encoder | 仅参数名包含 `encoder.update` 的 recurrent update 模块 |
 
@@ -138,7 +138,9 @@ Refine 不是 Init 之后在同一个 Trainer 内继续累计 step，而是新�
 - Refine 必须以本次同分辨率 OmniScene Init checkpoint 为唯一完整模型来源，并保持 `checkpointing.resume=false`、`checkpointing.resume_update_module=null`；
 - 112x200 与 224x400 分别独立完成 Init→Refine，不跨分辨率继承任务 checkpoint。
 
-这里有一个需要在实现阶段先验证的上游风险：RE10K 官方 Init/Refine 脚本同时改变了 `latent_downsample`、`fixed_latent_size` 和 `init_gaussian_multiple`，但只用 `checkpointing.no_strict_load=true` 加载 Init checkpoint。PyTorch 的 `strict=False` 可以忽略缺失/多余键，却通常不能忽略“同名但尺寸不同”的 tensor。正式训练前必须做一次 Init checkpoint 到 Refine 配置的 dry-load，并核对所有基础高斯预测参数是否正确载入；若存在尺寸冲突，应先报告并单独确定权重转换方案，不能静默丢弃冲突的高斯头后继续训练。
+实现阶段已验证上游 RE10K 阶段配置的风险：官方 Init 配置（`latent_downsample=4`、`fixed_latent_size=true`、`init_gaussian_multiple=16`）切换到 Refine 配置后，701 个同名 encoder 状态中有 6 个尺寸冲突，涉及 `gaussian_regressor.0.weight`、`proj.weight` 和 `gaussian_head`。PyTorch 的 `strict=False` 不能忽略同名 tensor 的尺寸冲突，也不能接受跳过这些基础预测层后冻结随机参数继续训练。
+
+OmniScene 最终采用“从 Init 开始使用最终基础拓扑”的兼容方案：两个阶段都使用 `latent_downsample=2`、`fixed_latent_size=false`、`init_gaussian_multiple=4`、`refine_same_num_points=true`；Init 保持 `num_refine=0`，Refine 再改为 `num_refine=2`。实测 Init 与 Refine 的 701 个同名基础状态全部尺寸兼容，Refine 仅新增 141 个 `encoder.update*` 状态。加载门禁允许且只允许这些 update 状态缺失，并拒绝基础状态缺失、unexpected keys 或任何同名尺寸冲突。
 
 ## 数据加载流程
 
@@ -201,7 +203,7 @@ DepthSplat 和 ReSplat 的 `DatasetCfgCommon`、`get_dataset`、`DataModule`、`
 
 DepthSplat 的单阶段 `training_step` 只处理一个输出，而 ReSplat 会对 Init/intermediate output 以及每次 recurrent refinement output 分别计算损失，因此不能只在最终输出处接入 mask。所有 target MSE/LPIPS 分支都必须使用同一个对齐后的 mask。`loss_on_input_views=false` 保持 RE10K 默认值；若将来开启 input-view supervision，应使用 context mask，不能把 18-view target mask 传给 6-view input render。
 
-ReSplat 当前 LPIPS mask 分支会原地修改 `prediction.color` 和 `batch["target"]["image"]`。在多次 refinement loss 中，这会污染后续输出的 GT 与指标。实现时应改为基于副本的 `masked_fill`/非原地遮罩，保持与 DepthSplat 相同的屏蔽语义，但不能直接复制其原地赋值写法。
+ReSplat 原 LPIPS mask 分支会原地修改 `prediction.color` 和 `batch["target"]["image"]`，在多次 refinement loss 中会污染后续输出的 GT 与指标。当前实现已改为基于副本的 `masked_fill` 非原地遮罩，保持与 DepthSplat 相同的屏蔽语义。
 
 ### 112x200 的实际裁剪说明
 
@@ -230,7 +232,7 @@ python -m src.main +experiment=omniscene_112x200 ...
 python -m src.main +experiment=omniscene_224x400 ...
 ```
 
-`src/main.py` 只需要增加 OmniScene 的训练期评测分支：当 `dataset.roots`/`dataset.name` 指向 OmniScene 时，不构造 RE10K 的 evaluation-index sampler，而是保留 `view_sampler=all`，复制当前 dataset 配置并把副本的 `test_split` 设为 `mini` 后交给 `run_full_test_sets_eval`。最终 `mode=test` 不走这份副本，直接使用 experiment 中的 `test_split=total`。
+`src/main.py` 已增加 OmniScene 的训练期评测分支：当 `dataset.name=omniscene` 时，不构造 RE10K 的 evaluation-index sampler，而是保留 `view_sampler=all`，复制当前 dataset 配置并把副本的 `test_split` 设为 `mini` 后交给 `run_full_test_sets_eval`。最终 `mode=test` 不走这份副本，直接使用 experiment 中的 `test_split=total`。
 
 ### Init 训练命令模板
 
@@ -239,7 +241,11 @@ python -m src.main +experiment=omniscene_224x400 ...
 ```bash
 CUDA_VISIBLE_DEVICES=<gpu> python -m src.main +experiment=omniscene_112x200 \
     trainer.max_steps=66667 \
-    model.encoder.init_gaussian_multiple=16 \
+    model.encoder.latent_downsample=2 \
+    model.encoder.fixed_latent_size=false \
+    model.encoder.init_gaussian_multiple=4 \
+    model.encoder.refine_same_num_points=true \
+    model.encoder.num_refine=0 \
     checkpointing.load=null \
     checkpointing.pretrained_model=null \
     checkpointing.pretrained_depth=pretrained/resplat-depth-base-352x640-60be7abf.pth \
@@ -324,10 +330,10 @@ rel_depth = (rel_depth - rel_depth.min()) / (rel_depth.max() - rel_depth.min())
 
 ReSplat 的 gsplat decoder 与 DepthSplat 不完全相同：它当前固定使用 `render_mode="RGB+ED"`，即使 `depth_mode=None` 也会返回 expected depth。因此数据侧不需要提供 metric depth，也不需要新增另一套深度 renderer。
 
-接入时仍建议在“`test.compute_scores=true` 且存在 `target.rel_depth`”时令 `depth_mode="depth"`，保持接口意图清晰，并处理两个 ReSplat 特有分支：
+当前实现在“`test.compute_scores=true` 且存在 `target.rel_depth`”时令 `depth_mode="depth"`，保持接口意图清晰，并处理两个 ReSplat 特有分支：
 
-- `test_step` 的最终 PCC 必须使用最后一次 refinement 的 `render_output[-1].depth`，不能使用 Init Gaussian 的 depth；
-- 当 `test.render_chunk_size` 非空时，当前代码只拼接 chunk 的 color、丢弃 depth，需要同时拼接各 chunk 的 `curr_output.depth`。
+- `test_step` 使用最后一次 refinement 的 Gaussian 重新渲染 depth，不能使用 Init Gaussian 的 depth；
+- 当 `test.render_chunk_size` 非空时，同时拼接各 chunk 的 color 与 depth。
 
 `run_full_test_sets_eval` 同样在 refinement 后读取最终 output depth。Init 阶段的训练期监控则使用 Init output depth。
 
@@ -357,7 +363,7 @@ pcc = compute_pcc(
 
 ## 实现文件清单
 
-计划新增：
+已新增：
 
 - `config/dataset/omniscene.yaml`
 - `config/dataset/view_sampler/all.yaml`
@@ -367,7 +373,7 @@ pcc = compute_pcc(
 - `src/dataset/utils_omniscene.py`
 - 4 个 OmniScene Init/Refine 运行脚本
 
-计划修改：
+已修改：
 
 - `src/dataset/__init__.py`：注册 dataset 与配置类型。
 - `src/dataset/view_sampler/__init__.py`：注册 `all` sampler。
@@ -379,17 +385,17 @@ pcc = compute_pcc(
 - `src/main.py`：OmniScene 训练期 mini eval 配置，不再要求 evaluation-index JSON。
 - `README.md`：实现完成并验证后补充两种分辨率、两阶段训练与完整测试命令。
 
-## 实现后的验证清单
+## 验证清单与当前状态
 
-1. **Hydra 配置检查**：分别打印两种 experiment 的最终 resolved config，确认 dataset、encoder、decoder、loss、三个 batch size、两阶段 steps、验证/测试节奏和完整 test split。
-2. **真实样本检查**：各 split 至少读取一个真实 bin，确认 context/target 为 6/18 views，逐图 K 正确，C2W 为 OpenCV convention，near/far 为 0.5/100。
-3. **两种分辨率检查**：loader 输出分别为 112x200、224x400；data shim 后分别为 112x192、224x400，且 image/mask/rel_depth 完全对齐。
-4. **mask 检查**：统计静态/动态像素比例，确认 `True=静态有效`，并验证 Init、intermediate、每一轮 Refine 的 target loss 都应用了 mask；LPIPS 不修改原始 GT tensor。
-5. **PCC 检查**：人工构造同序、逆序 depth 验证 PCC 约为 `+1/-1`；再用真实样本验证最终 refinement depth 与 relative depth shape 一致，chunk/non-chunk 结果一致。
-6. **两阶段 checkpoint 门禁**：先做 Init checkpoint 到 Refine 配置的 dry-load，列出 missing/unexpected/shape-mismatch keys；基础预测权重未正确加载时不得启动正式 Refine 训练。
-7. **单步 smoke**：两种分辨率分别完成 Init train/val/test 和 Refine train/val/test 的真实数据单步前向、反向与指标落盘。
-8. **完整测试完整性**：最终 test dataloader 长度等于 `bins_val_3.2m.json` 的完整长度；`scores_psnr_all.json`、`scores_ssim_all.json`、`scores_lpips_all.json`、`scores_pcc_all.json` 条目数全部一致。
+1. **已通过 Hydra 配置检查**：两种 experiment 均确认 dataset、encoder、decoder、loss、三个 batch size、两阶段 steps、验证/测试节奏和完整 test split。
+2. **真实样本检查待执行**：当前机器未找到 OmniScene 数据目录；获得数据后各 split 至少读取一个真实 bin，确认 context/target 为 6/18 views，逐图 K 正确，C2W 为 OpenCV convention，near/far 为 0.5/100。
+3. **已通过合成分辨率检查**：loader 和 data shim 验证 image/mask/rel_depth 使用相同裁剪；112x200 在 shim 后为 112x192，224x400 保持不变。
+4. **已通过 mask 数值检查**：确认 `True=静态有效`，MSE/LPIPS 排除动态区域，LPIPS 不修改原始 GT tensor；代码路径覆盖 Init、intermediate 和每一轮 Refine target loss。
+5. **PCC 基础检查已通过**：人工同序、逆序 depth 的 PCC 约为 `+1/-1`；真实样本的最终 refinement depth 及 chunk/non-chunk 一致性待数据可用后验证。
+6. **已通过两阶段拓扑门禁**：兼容方案的 701 个基础状态无尺寸冲突，只有 141 个 `encoder.update*` 状态允许缺失；运行时门禁会拒绝其它 missing/unexpected/shape-mismatch keys。真实 Init checkpoint 的最终 dry-load 在第一阶段产出 checkpoint 后执行。
+7. **真实数据单步 smoke 待执行**：数据可用后分别完成两种分辨率的 Init train/val/test 和 Refine train/val/test 前向、反向与指标落盘。
+8. **完整测试完整性待正式实验检查**：最终 test dataloader 长度应等于 `bins_val_3.2m.json` 的完整长度，四项指标 JSON 条目数必须一致。
 
 ## 小结
 
-OmniScene 的配置、6/18 视图数据组织、动态 mask、relative depth 与 PCC 主链路可以以 DepthSplat 为模板迁移；ReSplat 的核心模型和训练超参数则严格保留 RE10K base 方案。真正不能直接照搬的部分有三处：两阶段 `66_667 + 33_334` 预算与 checkpoint 交接、多轮 recurrent output 的 mask 接入、以及最终 refinement/chunk 路径的 depth 与 PCC。最终前馈主表只使用完整官方 test split，不包含 Center150。
+OmniScene 的配置、6/18 视图数据组织、动态 mask、relative depth 与 PCC 主链路以 DepthSplat 为模板迁移；ReSplat 的核心模型和训练超参数保留 RE10K base 方案，仅将 Init 提前切换到最终基础拓扑以修复已经复现的阶段 checkpoint 冲突。两阶段预算仍为 `66_667 + 33_334`，最终前馈主表只使用完整官方 test split，不包含 Center150。

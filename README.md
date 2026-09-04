@@ -1,3 +1,62 @@
+# 在 OmniScene 数据集上与 SVF-GS 进行对比
+
+数据组织、实验口径与实现细节见
+[`docs/OmniScene 数据集实验文档.md`](docs/OmniScene%20数据集实验文档.md)。
+两种分辨率都采用 Init `66,667` steps + Refine `33,334` steps，总计
+`100,001` optimizer steps；训练损失启用动态物体掩码。
+
+## 训练
+
+### 112x200
+
+```bash
+# 第一阶段：从头训练 Init
+bash scripts/omniscene_view6_112x200_base_init.sh
+
+# 第二阶段：传入本次 Init 产生的 checkpoint
+bash scripts/omniscene_view6_112x200_base_refine.sh <init-checkpoint>
+```
+
+### 224x400
+
+```bash
+# 第一阶段：从头训练 Init
+bash scripts/omniscene_view6_224x400_base_init.sh
+
+# 第二阶段：传入本次 Init 产生的 checkpoint
+bash scripts/omniscene_view6_224x400_base_refine.sh <init-checkpoint>
+```
+
+## 完整测试
+
+主表使用完整的官方 OmniScene test split，不使用 Center150。
+
+### 112x200
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=omniscene_112x200 \
+    mode=test \
+    dataset.test_split=total \
+    model.encoder.num_refine=2 \
+    checkpointing.pretrained_model=<refine-checkpoint> \
+    test.compute_scores=true \
+    output_dir=outputs/resplat-omniscene-112x200-base-refine-total
+```
+
+### 224x400
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=omniscene_224x400 \
+    mode=test \
+    dataset.test_split=total \
+    model.encoder.num_refine=2 \
+    checkpointing.pretrained_model=<refine-checkpoint> \
+    test.compute_scores=true \
+    output_dir=outputs/resplat-omniscene-224x400-base-refine-total
+```
+
+---
+
 <p align="center">
   <h1 align="center">ReSplat: Learning Recurrent Gaussian Splatting</h1>
   <p align="center">
@@ -92,7 +151,6 @@ ReSplat is trained in two stages: (1) initial Gaussian prediction and (2) recurr
 The training scripts in [scripts/](scripts) contain the exact commands and hyperparameters used for the experiments in our paper. Please refer to them for detailed configurations.
 
 Before training, you need to download the pre-trained [depth model](MODEL_ZOO.md), and set up your [wandb account](config/main.yaml) (in particular, by setting `wandb.entity=YOUR_ACCOUNT`) for logging.
-
 
 ## Citation
 

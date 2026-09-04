@@ -33,6 +33,7 @@ with install_import_hook(
     from src.misc.step_tracker import StepTracker
     from src.misc.wandb_tools import update_checkpoint_path
     from src.misc.resume_ckpt import find_latest_ckpt, no_resume_upsampler
+    from src.misc.checkpoint_loading import load_state_dict_with_shape_check
     from src.model.decoder import get_decoder
     from src.model.encoder import get_encoder
     from src.model.model_wrapper import ModelWrapper
@@ -50,60 +51,66 @@ def cyan(text: str) -> str:
 def train(cfg_dict: DictConfig):
     if cfg_dict["mode"] == "train" and cfg_dict["train"]["eval_model_every_n_val"] > 0:
         eval_cfg_dict = copy.deepcopy(cfg_dict)
-        dataset_dir = str(cfg_dict["dataset"]["roots"]).lower()
-        if "re10k" in dataset_dir:
-            if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
-                eval_path = "assets/evaluation_index_re10k.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 4:
-                eval_path = "assets/re10k_start_0_distance_150_ctx_4v_tgt_6v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 6:
-                eval_path = "assets/re10k_start_0_distance_200_ctx_6v_tgt_6v.json"
-            else:
-                if cfg_dict["trainer"]["eval_index"] is not None:
-                    eval_path = None  # placeholder
-                else:
-                    raise ValueError("unsupported number of views for re10k")
-        elif "dl3dv" in dataset_dir:
-            if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 6:
-                eval_path = "assets/dl3dv_start_0_distance_50_ctx_6v_tgt_8v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
-                eval_path = "assets/dl3dv_start_0_distance_20_ctx_2v_tgt_4v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 8:
-                eval_path = "assets/dl3dv_evaluation/dl3dv_start_0_distance_40_ctx_8v_tgt_8v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 16:
-                eval_path = "assets/dl3dv_evaluation/dl3dv_start_0_distance_80_ctx_16v_tgt_16v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 32:
-                eval_path = "assets/dl3dv_evaluation/dl3dv_start_0_distance_160_ctx_32v_tgt_24v.json"
-            elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 64:
-                eval_path = "assets/dl3dv_benchmark/dl3dv_ctx_64v_tgt_every8th.json"
-            else:
-                eval_path = None
-                # raise ValueError("unsupported number of views for dl3dv")
-        elif "scannet" in dataset_dir:
-            if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
-                eval_path = "assets/evaluation_index_scannet_view2.json"
-            else:
-                raise ValueError("unsupported number of views for scannet")
-        elif "tartanair" in dataset_dir:
-            if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
-                eval_path = 'assets/evaluation_index_tartanair_view2.json'
-            else:
-                raise ValueError("unsupported number of views for tartanair")
+        if cfg_dict["dataset"]["name"] == "omniscene":
+            # Use a fixed lightweight subset for quantitative monitoring during
+            # training. Standalone mode=test keeps test_split=total.
+            eval_cfg_dict["dataset"]["test_split"] = "mini"
+            eval_cfg = load_typed_root_config(eval_cfg_dict)
         else:
-            raise Exception("Fail to load eval index path")
-        eval_cfg_dict["dataset"]["view_sampler"] = {
-            "name": "evaluation",
-            "index_path": eval_path,
-            "num_context_views": cfg_dict["dataset"]["view_sampler"]["num_context_views"],
-        }
+            dataset_dir = str(cfg_dict["dataset"]["roots"]).lower()
+            if "re10k" in dataset_dir:
+                if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
+                    eval_path = "assets/evaluation_index_re10k.json"
+                elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 4:
+                    eval_path = "assets/re10k_start_0_distance_150_ctx_4v_tgt_6v.json"
+                elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 6:
+                    eval_path = "assets/re10k_start_0_distance_200_ctx_6v_tgt_6v.json"
+                else:
+                    if cfg_dict["trainer"]["eval_index"] is not None:
+                        eval_path = None  # placeholder
+                    else:
+                        raise ValueError("unsupported number of views for re10k")
+            elif "dl3dv" in dataset_dir:
+                if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 6:
+                    eval_path = "assets/dl3dv_start_0_distance_50_ctx_6v_tgt_8v.json"
+                elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
+                    eval_path = "assets/dl3dv_start_0_distance_20_ctx_2v_tgt_4v.json"
+                elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 8:
+                    eval_path = "assets/dl3dv_evaluation/dl3dv_start_0_distance_40_ctx_8v_tgt_8v.json"
+                elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 16:
+                    eval_path = "assets/dl3dv_evaluation/dl3dv_start_0_distance_80_ctx_16v_tgt_16v.json"
+                elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 32:
+                    eval_path = "assets/dl3dv_evaluation/dl3dv_start_0_distance_160_ctx_32v_tgt_24v.json"
+                elif cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 64:
+                    eval_path = "assets/dl3dv_benchmark/dl3dv_ctx_64v_tgt_every8th.json"
+                else:
+                    eval_path = None
+                    # raise ValueError("unsupported number of views for dl3dv")
+            elif "scannet" in dataset_dir:
+                if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
+                    eval_path = "assets/evaluation_index_scannet_view2.json"
+                else:
+                    raise ValueError("unsupported number of views for scannet")
+            elif "tartanair" in dataset_dir:
+                if cfg_dict["dataset"]["view_sampler"]["num_context_views"] == 2:
+                    eval_path = 'assets/evaluation_index_tartanair_view2.json'
+                else:
+                    raise ValueError("unsupported number of views for tartanair")
+            else:
+                raise Exception("Fail to load eval index path")
+            eval_cfg_dict["dataset"]["view_sampler"] = {
+                "name": "evaluation",
+                "index_path": eval_path,
+                "num_context_views": cfg_dict["dataset"]["view_sampler"]["num_context_views"],
+            }
 
-        # specify eval index
-        if cfg_dict["trainer"]["eval_index"] is not None:
-            eval_cfg_dict["dataset"]["view_sampler"]["index_path"] = cfg_dict["trainer"]["eval_index"]
+            # specify eval index
+            if cfg_dict["trainer"]["eval_index"] is not None:
+                eval_cfg_dict["dataset"]["view_sampler"]["index_path"] = cfg_dict["trainer"]["eval_index"]
 
-        assert eval_cfg_dict["dataset"]["view_sampler"]["index_path"] is not None, "no evaluation index path found!"
+            assert eval_cfg_dict["dataset"]["view_sampler"]["index_path"] is not None, "no evaluation index path found!"
 
-        eval_cfg = load_typed_root_config(eval_cfg_dict)
+            eval_cfg = load_typed_root_config(eval_cfg_dict)
     else:
         eval_cfg = None
 
@@ -233,7 +240,18 @@ def train(cfg_dict: DictConfig):
             if 'state_dict' in pretrained_model:
                 pretrained_model = pretrained_model['state_dict']
 
-            model_wrapper.load_state_dict(pretrained_model, strict=strict_load)
+            load_state_dict_with_shape_check(
+                model_wrapper,
+                pretrained_model,
+                strict=strict_load,
+                source=str(cfg.checkpointing.pretrained_model),
+                allowed_missing_prefixes=(
+                    ("encoder.update",)
+                    if cfg.model.encoder.num_refine > 0
+                    else None
+                ),
+                reject_unexpected=cfg.model.encoder.num_refine > 0,
+            )
             print(
                 cyan(
                     f"Loaded pretrained weights: {cfg.checkpointing.pretrained_model}"
@@ -300,7 +318,12 @@ def train(cfg_dict: DictConfig):
             if 'state_dict' in pretrained_model:
                 pretrained_model = pretrained_model['state_dict']
 
-            model_wrapper.load_state_dict(pretrained_model, strict=strict_load)
+            load_state_dict_with_shape_check(
+                model_wrapper,
+                pretrained_model,
+                strict=strict_load,
+                source=str(cfg.checkpointing.pretrained_model),
+            )
             print(
                 cyan(
                     f"Loaded pretrained weights: {cfg.checkpointing.pretrained_model}"

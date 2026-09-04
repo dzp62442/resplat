@@ -35,8 +35,16 @@ class LossMse(Loss[LossMseCfg, LossMseCfgWrapper]):
         else:
             delta = prediction.color - batch["target"]["image"]
 
-        if valid_depth_mask is not None and valid_depth_mask.max() > 0.5 and valid_depth_mask.min() < 0.5:
-            delta = delta[~valid_depth_mask]
+        if valid_depth_mask is not None:
+            if valid_depth_mask.shape != delta.shape:
+                raise ValueError(
+                    "Loss mask/image shape mismatch: "
+                    f"mask={tuple(valid_depth_mask.shape)}, image={tuple(delta.shape)}"
+                )
+            static_pixels = ~valid_depth_mask.bool()
+            if not static_pixels.any():
+                raise ValueError("Dynamic-object mask excludes every training pixel")
+            delta = delta[static_pixels]
 
         if clamp_large_error > 0:
             valid_mask = delta.abs() < clamp_large_error

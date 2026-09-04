@@ -1,0 +1,60 @@
+# @package _global_
+
+defaults:
+  - override /dataset: omniscene
+  - override /model/encoder: resplat
+  - override /loss: [mse, lpips]
+
+wandb:
+  name: omniscene_224x400
+  tags: [omniscene, 224x400]
+
+data_loader:
+  train:
+    batch_size: 1
+  val:
+    batch_size: 1
+  test:
+    batch_size: 1
+
+trainer:
+  # Total Init + Refine budget. Stage scripts override this with 66_667/33_334.
+  max_steps: 100_001
+  val_check_interval: 0.01
+  num_nodes: 1
+
+train:
+  eval_model_every_n_val: 10
+  eval_data_length: 2048
+  use_dynamic_mask: true
+
+model:
+  encoder:
+    num_depth_candidates: 128
+    # Keep the Init base topology identical to Refine so every base weight can
+    # be transferred; Init still disables the recurrent module (num_refine=0).
+    latent_downsample: 2
+    fixed_latent_size: false
+    init_gaussian_multiple: 4
+    refine_same_num_points: true
+
+loss:
+  lpips:
+    apply_after_step: 0
+    weight: 0.5
+    perceptual_loss: true
+
+dataset:
+  image_shape: [224, 400]
+  roots: [datasets/omniscene]
+  near: 0.5
+  far: 100.0
+  baseline_scale_bounds: false
+  make_baseline_1: false
+  train_times_per_scene: 1
+  augment: false
+  test_split: total
+
+test:
+  eval_time_skip_steps: 5
+  compute_scores: true

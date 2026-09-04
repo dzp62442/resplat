@@ -6,6 +6,7 @@ from jaxtyping import Float
 from lpips import LPIPS
 from skimage.metrics import structural_similarity
 from torch import Tensor
+from torchmetrics import PearsonCorrCoef
 
 
 @torch.no_grad()
@@ -31,6 +32,25 @@ def compute_lpips(
 ) -> Float[Tensor, " batch"]:
     value = get_lpips(predicted.device).forward(ground_truth, predicted, normalize=True)
     return value[:, 0, 0, 0]
+
+
+@cache
+def get_pcc(device: torch.device) -> PearsonCorrCoef:
+    return PearsonCorrCoef().to(device)
+
+
+@torch.no_grad()
+def compute_pcc(
+    ground_truth: Float[Tensor, "batch height width"],
+    predicted: Float[Tensor, "batch height width"],
+) -> Float[Tensor, ""]:
+    if ground_truth.shape != predicted.shape:
+        raise ValueError(
+            "PCC depth shape mismatch: "
+            f"ground_truth={tuple(ground_truth.shape)}, "
+            f"predicted={tuple(predicted.shape)}"
+        )
+    return get_pcc(predicted.device)(ground_truth.reshape(-1), predicted.reshape(-1))
 
 
 @torch.no_grad()

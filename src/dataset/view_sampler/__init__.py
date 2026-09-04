@@ -3,19 +3,22 @@ from typing import Any
 from ...misc.step_tracker import StepTracker
 from ..types import Stage
 from .view_sampler import ViewSampler
+from .view_sampler_all import ViewSamplerAll, ViewSamplerAllCfg
 from .view_sampler_bounded import ViewSamplerBounded, ViewSamplerBoundedCfg
 from .view_sampler_evaluation import ViewSamplerEvaluation, ViewSamplerEvaluationCfg
 from .view_sampler_bounded_v2 import ViewSamplerBoundedV2, ViewSamplerBoundedV2Cfg
 
 
 VIEW_SAMPLERS: dict[str, ViewSampler[Any]] = {
+    "all": ViewSamplerAll,
     "bounded": ViewSamplerBounded,
     "evaluation": ViewSamplerEvaluation,
     "boundedv2": ViewSamplerBoundedV2,
 }
 
 ViewSamplerCfg = (
-    ViewSamplerBoundedCfg
+    ViewSamplerAllCfg
+    | ViewSamplerBoundedCfg
     | ViewSamplerEvaluationCfg
     | ViewSamplerBoundedV2Cfg
 )

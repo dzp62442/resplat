@@ -24,7 +24,12 @@ import math
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
 from ..dataset import DatasetCfg
-from ..evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
+from ..evaluation.metrics import (
+    compute_lpips,
+    compute_pcc,
+    compute_psnr,
+    compute_ssim,
+)
 from ..global_cfg import get_cfg
 from ..loss import Loss
 from ..misc.benchmarker import Benchmarker
@@ -62,6 +67,24 @@ except:
     pass
 
 slurm_id_logged = False
+
+
+def _get_target_invalid_mask(
+    batch: BatchedExample,
+    target_image: Tensor,
+    use_dynamic_mask: bool,
+) -> Tensor | None:
+    if not use_dynamic_mask:
+        return None
+    if "masks" not in batch["target"]:
+        raise KeyError("train.use_dynamic_mask=true requires batch['target']['masks']")
+    static_mask = batch["target"]["masks"].bool()
+    if static_mask.shape != target_image.shape[:2] + target_image.shape[-2:]:
+        raise ValueError(
+            "Target mask/image shape mismatch: "
+            f"mask={tuple(static_mask.shape)}, image={tuple(target_image.shape)}"
+        )
+    return (~static_mask).unsqueeze(2).expand_as(target_image)
 
 
 @dataclass
@@ -129,6 +152,9 @@ class TrainCfg:
 
     # local window training
     train_window_size: int | None
+
+    # Ignore dynamic-object pixels in target-view training losses.
+    use_dynamic_mask: bool
 
 
 @runtime_checkable
@@ -403,7 +429,9 @@ class ModelWrapper(LightningModule):
         # Compute and log loss.
         total_loss = 0
 
-        valid_depth_mask = None
+        valid_depth_mask = _get_target_invalid_mask(
+            batch, target_gt, self.train_cfg.use_dynamic_mask
+        )
 
         # loss with refinement
         if self.encoder.cfg.num_refine > 0:
@@ -465,7 +493,7 @@ class ModelWrapper(LightningModule):
                                 self.global_step,
     
                                 clamp_large_error=self.train_cfg.train_ignore_large_loss,
-                                valid_depth_mask=valid_depth_mask,
+                                valid_depth_mask=None,
                                 loss_on_input_views=True,
                             )
                         else:
@@ -474,7 +502,7 @@ class ModelWrapper(LightningModule):
                                 batch,
                                 gaussian_output[i],
                                 self.global_step,
-                                valid_depth_mask=valid_depth_mask,
+                                valid_depth_mask=None,
                                 loss_on_input_views=True,
                                 half_res_lpips=self.train_cfg.half_res_lpips_loss,
                             )
@@ -717,6 +745,12 @@ class ModelWrapper(LightningModule):
 
     def test_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
+        should_render_target_depth = (
+            self.test_cfg.compute_scores
+            and not self.test_cfg.render_input_views
+            and "rel_depth" in batch["target"]
+        )
+        depth_mode = "depth" if should_render_target_depth else None
         if self.test_cfg.render_input_views:
             # to see how good the model performs on the input views
             b, v, _, h, w = batch["context"]["image"].shape
@@ -962,16 +996,23 @@ class ModelWrapper(LightningModule):
                         render_near[:, start:end],
                         render_far[:, start:end],
                         (h, w),
-                        depth_mode=None,
+                        depth_mode=depth_mode,
                     )
 
                     if i == 0:
                         output = curr_output
                     else:
-                        # ignore depth
                         output.color = torch.cat(
                             (output.color, curr_output.color), dim=1
                         )
+                        if should_render_target_depth:
+                            if output.depth is None or curr_output.depth is None:
+                                raise RuntimeError(
+                                    "Decoder did not return depth required for PCC"
+                                )
+                            output.depth = torch.cat(
+                                (output.depth, curr_output.depth), dim=1
+                            )
 
             else:
                 if self.test_cfg.render_input_views:
@@ -982,7 +1023,7 @@ class ModelWrapper(LightningModule):
                         batch["context"]["near"],
                         batch["context"]["far"],
                         (h, w),
-                        depth_mode=None,
+                        depth_mode=depth_mode,
                     )
                 else:
                     output = self.decoder.forward(
@@ -992,7 +1033,7 @@ class ModelWrapper(LightningModule):
                         batch["target"]["near"],
                         batch["target"]["far"],
                         (h, w),
-                        depth_mode=None,
+                        depth_mode=depth_mode,
                     )
 
         (scene,) = batch["scene"]
@@ -1095,6 +1136,18 @@ class ModelWrapper(LightningModule):
             self.test_step_outputs[f"lpips"].append(
                 compute_lpips(rgb_gt, rgb).mean().item()
             )
+
+            if should_render_target_depth:
+                if output.depth is None:
+                    raise RuntimeError("Decoder did not return depth required for PCC")
+                pcc = compute_pcc(
+                    rearrange(
+                        batch["target"]["rel_depth"],
+                        "b v h w -> (b v) h w",
+                    ),
+                    rearrange(output.depth, "b v h w -> (b v) h w"),
+                )
+                self.test_step_outputs.setdefault("pcc", []).append(pcc.item())
 
             # compute depth metrics
             if pred_depths is not None and depth_gt is not None:
@@ -1481,7 +1534,7 @@ class ModelWrapper(LightningModule):
         )
         scores_dict = {}
 
-        for score_tag in ("psnr", "ssim", "lpips"):
+        for score_tag in ("psnr", "ssim", "lpips", "pcc"):
             scores_dict[score_tag] = {}
             for method_tag in ("deterministic", "probabilistic"):
                 scores_dict[score_tag][method_tag] = []
@@ -1620,6 +1673,8 @@ class ModelWrapper(LightningModule):
                         gaussians_probabilistic = gaussians_probabilistic["gaussians"]
 
             with self.benchmarker.time("decoder", num_calls=v):
+                has_rel_depth = "rel_depth" in batch["target"]
+                depth_mode = "depth" if has_rel_depth else None
                 output_probabilistic = self.decoder.forward(
                     gaussians_probabilistic,
                     batch["target"]["extrinsics"],
@@ -1627,7 +1682,7 @@ class ModelWrapper(LightningModule):
                     batch["target"]["near"],
                     batch["target"]["far"],
                     (h, w),
-                    depth_mode=None,
+                    depth_mode=depth_mode,
                 )
 
                 # refine
@@ -1661,6 +1716,7 @@ class ModelWrapper(LightningModule):
                     batch["target"]["near"],
                     batch["target"]["far"],
                     (h, w),
+                    depth_mode=depth_mode,
                 )
                 rgbs.append(output_deterministic.color[0])
                 tags.append("deterministic")
@@ -1677,6 +1733,21 @@ class ModelWrapper(LightningModule):
                 scores_dict["ssim"][tag].append(
                     compute_ssim(rgb_gt, rgb).mean().item()
                 )
+
+            if has_rel_depth:
+                if output_probabilistic.depth is None:
+                    raise RuntimeError("Decoder did not return depth required for PCC")
+                pcc = compute_pcc(
+                    rearrange(
+                        batch["target"]["rel_depth"],
+                        "b v h w -> (b v) h w",
+                    ),
+                    rearrange(
+                        output_probabilistic.depth,
+                        "b v h w -> (b v) h w",
+                    ),
+                )
+                scores_dict["pcc"]["probabilistic"].append(pcc.item())
 
             # compute depth metrics
             if pred_depths is not None and depth_gt is not None and depth_gt.max() > 0:
