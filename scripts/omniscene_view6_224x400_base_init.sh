@@ -13,6 +13,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python -m src.main \
     checkpointing.load=null \
     checkpointing.pretrained_model=null \
     checkpointing.pretrained_depth=pretrained/resplat-depth-base-352x640-60be7abf.pth \
+    checkpointing.no_resume_upsampler=true \
     checkpointing.resume=false \
     checkpointing.resume_update_module=null \
     train.use_dynamic_mask=true \
