@@ -16,6 +16,7 @@ from src.evaluation.metrics import compute_pcc
 from src.loss.loss_lpips import LossLpips, LossLpipsCfg
 from src.loss.loss_mse import LossMse, LossMseCfg, LossMseCfgWrapper
 from src.misc.checkpoint_loading import load_state_dict_with_shape_check
+from src.misc.final_checkpoint import get_final_checkpoint_path
 from src.model.decoder.decoder import DecoderOutput
 from src.model.model_wrapper import _get_target_invalid_mask
 
@@ -269,6 +270,16 @@ class TestOmniScene(unittest.TestCase):
                 allowed_missing_prefixes=("update.",),
                 reject_unexpected=True,
             )
+
+    def test_final_checkpoint_uses_exact_stage_step(self) -> None:
+        self.assertEqual(
+            get_final_checkpoint_path(Path("checkpoints"), 66_667),
+            Path("checkpoints/final-step_66667.ckpt"),
+        )
+        self.assertEqual(
+            get_final_checkpoint_path(Path("checkpoints"), 33_334),
+            Path("checkpoints/final-step_33334.ckpt"),
+        )
 
 
 if __name__ == "__main__":

@@ -13,8 +13,9 @@
 # 第一阶段：从头训练 Init
 bash scripts/omniscene_view6_112x200_base_init.sh
 
-# 第二阶段：传入本次 Init 产生的 checkpoint
-bash scripts/omniscene_view6_112x200_base_refine.sh <init-checkpoint>
+# 第一阶段完成后启动 Refine
+bash scripts/omniscene_view6_112x200_base_refine.sh \
+    checkpoints/resplat/omniscene-view6-112x200/base-init/checkpoints/final-step_66667.ckpt
 ```
 
 ### 224x400
@@ -23,8 +24,9 @@ bash scripts/omniscene_view6_112x200_base_refine.sh <init-checkpoint>
 # 第一阶段：从头训练 Init
 bash scripts/omniscene_view6_224x400_base_init.sh
 
-# 第二阶段：传入本次 Init 产生的 checkpoint
-bash scripts/omniscene_view6_224x400_base_refine.sh <init-checkpoint>
+# 第一阶段完成后启动 Refine
+bash scripts/omniscene_view6_224x400_base_refine.sh \
+    checkpoints/resplat/omniscene-view6-224x400/base-init/checkpoints/final-step_66667.ckpt
 ```
 
 ## 完整测试
@@ -38,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=omniscene_112x200 \
     mode=test \
     dataset.test_split=total \
     model.encoder.num_refine=2 \
-    checkpointing.pretrained_model=<refine-checkpoint> \
+    checkpointing.pretrained_model=checkpoints/resplat/omniscene-view6-112x200/base-refine/checkpoints/final-step_33334.ckpt \
     test.compute_scores=true \
     output_dir=outputs/resplat-omniscene-112x200-base-refine-total
 ```
@@ -50,7 +52,7 @@ CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=omniscene_224x400 \
     mode=test \
     dataset.test_split=total \
     model.encoder.num_refine=2 \
-    checkpointing.pretrained_model=<refine-checkpoint> \
+    checkpointing.pretrained_model=checkpoints/resplat/omniscene-view6-224x400/base-refine/checkpoints/final-step_33334.ckpt \
     test.compute_scores=true \
     output_dir=outputs/resplat-omniscene-224x400-base-refine-total
 ```

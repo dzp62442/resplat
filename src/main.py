@@ -30,6 +30,7 @@ with install_import_hook(
     from src.global_cfg import set_cfg
     from src.loss import get_losses
     from src.misc.LocalLogger import LocalLogger
+    from src.misc.final_checkpoint import FinalCheckpoint
     from src.misc.step_tracker import StepTracker
     from src.misc.wandb_tools import update_checkpoint_path
     from src.misc.resume_ckpt import find_latest_ckpt, no_resume_upsampler
@@ -165,6 +166,7 @@ def train(cfg_dict: DictConfig):
             mode="max",
         )
     )
+    callbacks.append(FinalCheckpoint(output_dir / "checkpoints"))
     for cb in callbacks:
         cb.CHECKPOINT_EQUALS_CHAR = '_'
 

@@ -131,6 +131,8 @@ ReSplat 原始 `config/experiment/re10k.yaml` 用 `trainer.max_steps=300_001` �
 
 Refine 不是 Init 之后在同一个 Trainer 内继续累计 step，而是新建 Trainer、载入 Init checkpoint、冻结基础 encoder，再从 stage-local step 0 训练 update 模块。因此最终 checkpoint 的 Lightning `global_step` 约为 `33_334`，论文中的训练预算需要按两个阶段外部求和为 `100_001`。
 
+原项目的周期 checkpoint 每 1000 step 保存一次，而 Lightning 的 `ModelCheckpoint.on_train_end` 不会自动补存非整千的结束 step。当前分支增加了 final-checkpoint callback：Init 正常结束后固定保存 `checkpoints/final-step_66667.ckpt`，Refine 正常结束后固定保存 `checkpoints/final-step_33334.ckpt`，从而保证阶段交接和最终测试使用精确预算对应的权重，而不是误用 66,000/33,000-step 周期 checkpoint。
+
 这里的“从头训练”具体定义为：
 
 - Init 必须设置 `checkpointing.load=null`、`checkpointing.pretrained_model=null`、`checkpointing.resume=false`、`checkpointing.resume_update_module=null`，不得加载作者发布的完整 ReSplat 权重或任何 RE10K 训练 checkpoint；
