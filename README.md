@@ -36,12 +36,8 @@ We recommend setting up a virtual environment (e.g., [conda](https://docs.anacon
 conda create -y -n resplat python=3.12
 conda activate resplat
 
-# or venv
-# python -m venv /path/to/venv/resplat
-# source /path/to/venv/resplat/bin/activate
-
-# torch 2.7.0, cuda 12.8
-pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+# torch 2.7.0, cuda 12.8 改为 11.8
+pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu118
 
 pip install -r requirements.txt
 
