@@ -126,6 +126,7 @@ ReSplat 原始 `config/experiment/re10k.yaml` 用 `trainer.max_steps=300_001` �
 | `model.encoder.fixed_latent_size` | `false` | `false` |
 | `model.encoder.init_gaussian_multiple` | `4` | `4` |
 | `model.encoder.refine_same_num_points` | `true` | `true` |
+| `model.encoder.recurrent_use_checkpointing` | `false` | `true` |
 | 基础权重来源 | 官方 ReSplat depth base 预训练权重 | 本分辨率 Init 阶段 checkpoint |
 | 可训练参数 | Init encoder | 仅参数名包含 `encoder.update` 的 recurrent update 模块 |
 
@@ -143,6 +144,8 @@ Refine 不是 Init 之后在同一个 Trainer 内继续累计 step，而是新�
 实现阶段已验证上游 RE10K 阶段配置的风险：官方 Init 配置（`latent_downsample=4`、`fixed_latent_size=true`、`init_gaussian_multiple=16`）切换到 Refine 配置后，701 个同名 encoder 状态中有 6 个尺寸冲突，涉及 `gaussian_regressor.0.weight`、`proj.weight` 和 `gaussian_head`。PyTorch 的 `strict=False` 不能忽略同名 tensor 的尺寸冲突，也不能接受跳过这些基础预测层后冻结随机参数继续训练。
 
 OmniScene 最终采用“从 Init 开始使用最终基础拓扑”的兼容方案：两个阶段都使用 `latent_downsample=2`、`fixed_latent_size=false`、`init_gaussian_multiple=4`、`refine_same_num_points=true`；Init 保持 `num_refine=0`，Refine 再改为 `num_refine=2`。实测 Init 与 Refine 的 701 个同名基础状态全部尺寸兼容，Refine 仅新增 141 个 `encoder.update*` 状态。加载门禁允许且只允许这些 update 状态缺失，并拒绝基础状态缺失、unexpected keys 或任何同名尺寸冲突。
+
+在单张 24 GB GPU 上，六视图 Refine 的 recurrent point transformer 需要启用 `recurrent_use_checkpointing=true`。该设置仅用反向重计算换取更低的激活显存，不改变模型参数、前向结果、损失、batch size 或 optimizer step 口径。原发布代码的这一分支漏传 `knn_idx`，实现阶段已修复为向 checkpoint 显式传入当前 transformer block 和缓存的 KNN 索引，避免闭包在反向重计算时引用错误 block。
 
 ## 数据加载流程
 
@@ -272,6 +275,7 @@ CUDA_VISIBLE_DEVICES=<gpu> python -m src.main +experiment=omniscene_112x200 \
     model.encoder.init_gaussian_multiple=4 \
     model.encoder.num_refine=2 \
     model.encoder.refine_same_num_points=true \
+    model.encoder.recurrent_use_checkpointing=true \
     optimizer.lr=1e-4 \
     optimizer.lr_monodepth=0. \
     checkpointing.load=null \

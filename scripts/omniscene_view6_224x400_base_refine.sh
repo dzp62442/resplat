@@ -18,6 +18,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python -m src.main \
     model.encoder.init_gaussian_multiple=4 \
     model.encoder.num_refine=2 \
     model.encoder.refine_same_num_points=true \
+    model.encoder.recurrent_use_checkpointing=true \
     optimizer.lr=1e-4 \
     optimizer.lr_monodepth=0. \
     checkpointing.load=null \
