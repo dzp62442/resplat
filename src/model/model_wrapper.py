@@ -156,6 +156,13 @@ class TrainCfg:
     # Ignore dynamic-object pixels in target-view training losses.
     use_dynamic_mask: bool
 
+    # Refinement-only observability and fail-safe controls.
+    diagnostics_log_every_n_steps: int
+    diagnostics_stop_on_divergence: bool
+    diagnostics_scale_mean_threshold: float
+    diagnostics_delta_scale_mean_threshold: float
+    diagnostics_divergence_patience: int
+
 
 @runtime_checkable
 class TrajectoryFn(Protocol):
@@ -210,10 +217,262 @@ class ModelWrapper(LightningModule):
         # This is used for testing.
         self.benchmarker = Benchmarker()
         self.eval_cnt = 0
+        self._diagnostic_divergence_streak = 0
+        self._diagnostic_stop_reason: str | None = None
+        self._diagnostic_stop_handled = False
 
         if self.test_cfg.compute_scores:
             self.test_step_outputs = {}
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
+
+    def _diagnostics_enabled(self) -> bool:
+        return (
+            self.encoder.cfg.num_refine > 0
+            and self.train_cfg.diagnostics_log_every_n_steps > 0
+        )
+
+    def _should_log_diagnostics(self) -> bool:
+        interval = self.train_cfg.diagnostics_log_every_n_steps
+        return self._diagnostics_enabled() and self.global_step % interval == 0
+
+    @staticmethod
+    def _gradient_norm(parameters) -> Tensor:
+        gradients = [
+            parameter.grad.detach()
+            for parameter in parameters
+            if parameter.grad is not None
+        ]
+        if not gradients:
+            return torch.zeros(())
+        per_tensor_norms = torch.stack(
+            [gradient.float().norm(2) for gradient in gradients]
+        )
+        return per_tensor_norms.norm(2)
+
+    def _log_gradient_diagnostics(
+        self,
+        prefix: str,
+        total_norm: Tensor | None = None,
+    ) -> Tensor:
+        if total_norm is None:
+            total_norm = self._gradient_norm(self.parameters()).to(self.device)
+        self.log(
+            f"diagnostics/grad_{prefix}_total_norm",
+            total_norm,
+            on_step=True,
+            on_epoch=False,
+        )
+        self.log(
+            f"diagnostics/grad_{prefix}_is_finite",
+            torch.isfinite(total_norm).float(),
+            on_step=True,
+            on_epoch=False,
+        )
+
+        if prefix == "pre_clip":
+            parameter_groups = {
+                "update_proj": self.encoder.update_proj.parameters(),
+                "update_rgb_error_proj": self.encoder.update_rgb_error_proj.parameters(),
+                "update_module": self.encoder.update_module.parameters(),
+                "update_head": self.encoder.update_head.parameters(),
+                "update_error_attn": self.encoder.update_error_attn.parameters(),
+            }
+            for name, parameters in parameter_groups.items():
+                self.log(
+                    f"diagnostics/grad_pre_clip_{name}_norm",
+                    self._gradient_norm(parameters).to(self.device),
+                    on_step=True,
+                    on_epoch=False,
+                )
+
+        return total_norm
+
+    def on_before_optimizer_step(self, optimizer: optim.Optimizer) -> None:
+        if not self._diagnostics_enabled():
+            return
+
+        # Lightning calls this hook after AMP unscaling and before gradient
+        # clipping, so this norm reflects the gradient that clipping sees.
+        total_norm = self._gradient_norm(self.parameters()).to(self.device)
+        if self._should_log_diagnostics():
+            self._log_gradient_diagnostics("pre_clip", total_norm)
+
+        if not torch.isfinite(total_norm):
+            self._diagnostic_stop_reason = (
+                f"non-finite pre-clip gradient norm at step {self.global_step}"
+            )
+            self.log(
+                "diagnostics/nonfinite_gradient_detected",
+                1.0,
+                on_step=True,
+                on_epoch=False,
+            )
+            # Prevent a non-finite gradient from contaminating AdamW before the
+            # batch-end hook saves the diagnostic checkpoint and stops cleanly.
+            optimizer.zero_grad(set_to_none=True)
+
+    def configure_gradient_clipping(
+        self,
+        optimizer: optim.Optimizer,
+        gradient_clip_val: int | float | None = None,
+        gradient_clip_algorithm: str | None = None,
+    ) -> None:
+        super().configure_gradient_clipping(
+            optimizer,
+            gradient_clip_val=gradient_clip_val,
+            gradient_clip_algorithm=gradient_clip_algorithm,
+        )
+        if self._should_log_diagnostics():
+            self._log_gradient_diagnostics("post_clip")
+
+    @torch.no_grad()
+    def _log_refinement_diagnostics(
+        self,
+        render_output: list[DecoderOutput],
+        gaussian_output: list[Gaussians],
+        batch: BatchedExample,
+    ) -> None:
+        if not self._should_log_diagnostics():
+            return
+
+        relative_depth = batch["target"].get("rel_depth")
+        for i, (rendered, gaussians) in enumerate(
+            zip(render_output, gaussian_output)
+        ):
+            prefix = f"diagnostics/update{i}"
+            scales = gaussians.scales.detach().float()
+            means = gaussians.means.detach().float()
+            opacities = gaussians.opacities.detach().float()
+            self.log_dict(
+                {
+                    f"{prefix}_gaussian_scale_mean": scales.mean(),
+                    f"{prefix}_gaussian_scale_std": scales.std(correction=0),
+                    f"{prefix}_gaussian_scale_max": scales.max(),
+                    f"{prefix}_gaussian_mean_abs_mean": means.abs().mean(),
+                    f"{prefix}_gaussian_mean_abs_max": means.abs().max(),
+                    f"{prefix}_gaussian_opacity_mean": opacities.mean(),
+                },
+                on_step=True,
+                on_epoch=False,
+            )
+
+            if rendered.depth is None:
+                continue
+            depth = rendered.depth.detach().float()
+            finite = torch.isfinite(depth)
+            finite_fraction = finite.float().mean()
+            safe_depth = torch.where(finite, depth, torch.zeros_like(depth))
+            finite_count = finite.sum().clamp_min(1)
+            depth_mean = safe_depth.sum() / finite_count
+            centered_depth = torch.where(
+                finite,
+                depth - depth_mean,
+                torch.zeros_like(depth),
+            )
+            depth_std = torch.sqrt(
+                centered_depth.square().sum() / finite_count
+            )
+            per_view_std = safe_depth.flatten(-2).std(dim=-1, correction=0)
+            self.log_dict(
+                {
+                    f"{prefix}_render_depth_mean": depth_mean,
+                    f"{prefix}_render_depth_std": depth_std,
+                    f"{prefix}_render_depth_per_view_std_min": per_view_std.min(),
+                    f"{prefix}_render_depth_per_view_std_mean": per_view_std.mean(),
+                    f"{prefix}_render_depth_finite_fraction": finite_fraction,
+                },
+                on_step=True,
+                on_epoch=False,
+            )
+
+            if rendered.accumulated_alpha is not None:
+                self.log(
+                    f"{prefix}_render_alpha_mean",
+                    rendered.accumulated_alpha.detach().float().mean(),
+                    on_step=True,
+                    on_epoch=False,
+                )
+
+            if relative_depth is not None and relative_depth.shape == depth.shape:
+                gt = relative_depth.detach().float()
+                valid = finite & torch.isfinite(gt)
+                predicted_valid = depth[valid]
+                target_valid = gt[valid]
+                if predicted_valid.numel() > 1:
+                    predicted_centered = predicted_valid - predicted_valid.mean()
+                    target_centered = target_valid - target_valid.mean()
+                    denominator = (
+                        predicted_centered.norm(2) * target_centered.norm(2)
+                    ).clamp_min(1e-12)
+                    pcc = (predicted_centered * target_centered).sum() / denominator
+                    self.log(
+                        f"{prefix}_render_depth_pcc",
+                        pcc,
+                        on_step=True,
+                        on_epoch=False,
+                    )
+
+    def _update_divergence_guard(
+        self,
+        gaussian_scale_mean: float,
+        last_delta_scale_mean: float,
+        scene_names: list[str],
+    ) -> None:
+        if not self.train_cfg.diagnostics_stop_on_divergence:
+            return
+
+        over_threshold = (
+            not math.isfinite(gaussian_scale_mean)
+            or not math.isfinite(last_delta_scale_mean)
+            or gaussian_scale_mean
+            > self.train_cfg.diagnostics_scale_mean_threshold
+            or last_delta_scale_mean
+            > self.train_cfg.diagnostics_delta_scale_mean_threshold
+        )
+        self._diagnostic_divergence_streak = (
+            self._diagnostic_divergence_streak + 1 if over_threshold else 0
+        )
+        if self._should_log_diagnostics():
+            self.log(
+                "diagnostics/divergence_streak",
+                float(self._diagnostic_divergence_streak),
+                on_step=True,
+                on_epoch=False,
+            )
+
+        if (
+            self._diagnostic_divergence_streak
+            >= self.train_cfg.diagnostics_divergence_patience
+            and self._diagnostic_stop_reason is None
+        ):
+            self._diagnostic_stop_reason = (
+                "recurrent Gaussian scale runaway: "
+                f"scale_mean={gaussian_scale_mean:.6g}, "
+                f"last_delta_scale_mean={last_delta_scale_mean:.6g}, "
+                f"streak={self._diagnostic_divergence_streak}, "
+                f"step={self.global_step}, "
+                f"scene={','.join(scene_names)}"
+            )
+
+    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
+        del outputs, batch, batch_idx
+        if self._diagnostic_stop_reason is None or self._diagnostic_stop_handled:
+            return
+
+        self._diagnostic_stop_handled = True
+        self.trainer.should_stop = True
+        checkpoint_path = (
+            Path(get_cfg()["output_dir"])
+            / "checkpoints"
+            / f"diagnostic-divergence-step_{self.global_step}.ckpt"
+        )
+        self.trainer.save_checkpoint(checkpoint_path)
+        if self.trainer.is_global_zero:
+            print(
+                "Diagnostic divergence guard stopped training: "
+                f"{self._diagnostic_stop_reason}"
+            )
+            print(f"Saved diagnostic checkpoint: {checkpoint_path}")
 
     def training_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
@@ -363,6 +622,9 @@ class ModelWrapper(LightningModule):
 
             delta_means = refine_output['delta_means']
             delta_scales = refine_output['delta_scales']
+            applied_delta_scales = refine_output.get(
+                'applied_delta_scales', delta_scales
+            )
 
             # the last output
             output = render_output[-1]
@@ -685,7 +947,13 @@ class ModelWrapper(LightningModule):
 
         # log gaussians scales
         if self.encoder.cfg.num_refine > 0:
+            self._log_refinement_diagnostics(
+                render_output,
+                gaussian_output,
+                batch,
+            )
             num_output = len(delta_means)
+            delta_scale_means = []
             # delta means
             if isinstance(delta_means[0], torch.Tensor):
                 for i in range(num_output):
@@ -697,12 +965,32 @@ class ModelWrapper(LightningModule):
             if isinstance(delta_scales[0], torch.Tensor):
                 for i in range(num_output):
                     self.log(f"update{i}/delta_scales_min", delta_scales[i].abs().min().item())
-                    self.log(f"update{i}/delta_scales_mean", delta_scales[i].abs().mean().item())
+                    delta_scale_mean = delta_scales[i].abs().mean().item()
+                    delta_scale_means.append(delta_scale_mean)
+                    self.log(f"update{i}/delta_scales_mean", delta_scale_mean)
                     self.log(f"update{i}/delta_scales_max", delta_scales[i].abs().max().item())
+                    self.log(
+                        f"update{i}/applied_delta_scales_mean",
+                        applied_delta_scales[i].abs().mean().item(),
+                    )
+                    self.log(
+                        f"update{i}/applied_delta_scales_max",
+                        applied_delta_scales[i].abs().max().item(),
+                    )
 
-        self.log("info/gaussian_scale_min", gaussians.scales.min().item())
-        self.log("info/gaussian_scale_max", gaussians.scales.max().item())
-        self.log("info/gaussian_scale_mean", gaussians.scales.mean().item())
+        gaussian_scale_min = gaussians.scales.min().item()
+        gaussian_scale_max = gaussians.scales.max().item()
+        gaussian_scale_mean = gaussians.scales.mean().item()
+        self.log("info/gaussian_scale_min", gaussian_scale_min)
+        self.log("info/gaussian_scale_max", gaussian_scale_max)
+        self.log("info/gaussian_scale_mean", gaussian_scale_mean)
+
+        if self.encoder.cfg.num_refine > 0 and delta_scale_means:
+            self._update_divergence_guard(
+                gaussian_scale_mean,
+                delta_scale_means[-1],
+                batch["scene"],
+            )
 
         # log gaussians opacities
         self.log("info/gaussian_opacity_min", gaussians.opacities.min().item())

@@ -73,6 +73,12 @@ train_min_refine: 0
 train_max_refine: 0
 num_basic_refine_blocks: 4
 
+# Refinement scale stabilization. The additive default preserves released-model
+# behavior; bounded_additive is enabled explicitly for OmniScene Refine runs.
+refine_scale_update_mode: additive
+refine_scale_delta_max: 0.5
+refine_scale_max: null
+
 # Refinement state
 state_channels: 512
 
@@ -91,6 +97,7 @@ render_error_mv_attn_blocks: 1
 use_amp: true
 pt_head_amp: true
 pt_update_amp: true
+refine_update_head_fp32: false
 
 # Checkpointing
 use_checkpointing: false

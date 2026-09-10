@@ -18,7 +18,8 @@ from src.loss.loss_mse import LossMse, LossMseCfg, LossMseCfgWrapper
 from src.misc.checkpoint_loading import load_state_dict_with_shape_check
 from src.misc.final_checkpoint import get_final_checkpoint_path
 from src.model.decoder.decoder import DecoderOutput
-from src.model.model_wrapper import _get_target_invalid_mask
+from src.model.encoder.encoder_resplat import _apply_refine_scale_update
+from src.model.model_wrapper import ModelWrapper, _get_target_invalid_mask
 
 
 class DummyPerceptualLoss(nn.Module):
@@ -34,6 +35,89 @@ class DummyStagedModel(nn.Module):
 
 
 class TestOmniScene(unittest.TestCase):
+    def test_bounded_refine_scale_update(self) -> None:
+        previous = torch.tensor([[0.2, 1.0, 3.9]])
+        raw_delta = torch.tensor([[-100.0, 100.0, 100.0]])
+
+        updated, applied = _apply_refine_scale_update(
+            previous,
+            raw_delta,
+            mode="bounded_additive",
+            min_scale=1e-6,
+            max_delta=0.5,
+            max_scale=4.0,
+        )
+
+        self.assertTrue(torch.all(updated >= 1e-6))
+        self.assertTrue(torch.all(updated <= 4.0))
+        self.assertTrue(torch.all(applied.abs() <= 0.5 + 1e-6))
+        self.assertAlmostEqual(updated[0, 2].item(), 4.0)
+
+        near_zero_raw = torch.tensor(
+            [[-1e-4, 0.0, 1e-4]], requires_grad=True
+        )
+        near_zero_updated, near_zero_applied = _apply_refine_scale_update(
+            previous,
+            near_zero_raw,
+            mode="bounded_additive",
+            min_scale=1e-6,
+            max_delta=0.5,
+            max_scale=4.0,
+        )
+        self.assertTrue(
+            torch.allclose(near_zero_applied, near_zero_raw, atol=2e-7)
+        )
+        near_zero_updated.sum().backward()
+        self.assertTrue(torch.isfinite(near_zero_raw.grad).all())
+
+        additive_updated, _ = _apply_refine_scale_update(
+            previous,
+            torch.tensor([[-1.0, 2.0, 3.0]]),
+            mode="additive",
+            min_scale=1e-6,
+            max_delta=0.5,
+            max_scale=4.0,
+        )
+        self.assertTrue(
+            torch.allclose(
+                additive_updated,
+                torch.tensor([[1e-6, 3.0, 6.9]]),
+            )
+        )
+
+    def test_refine_diagnostic_gradient_norm_and_guard(self) -> None:
+        first = nn.Parameter(torch.zeros(2))
+        second = nn.Parameter(torch.zeros(1))
+        first.grad = torch.tensor([3.0, 4.0])
+        second.grad = torch.tensor([12.0])
+        self.assertAlmostEqual(
+            ModelWrapper._gradient_norm([first, second]).item(),
+            13.0,
+        )
+
+        wrapper = ModelWrapper.__new__(ModelWrapper)
+        nn.Module.__init__(wrapper)
+        wrapper.train_cfg = SimpleNamespace(
+            diagnostics_log_every_n_steps=0,
+            diagnostics_stop_on_divergence=True,
+            diagnostics_scale_mean_threshold=2.0,
+            diagnostics_delta_scale_mean_threshold=1.0,
+            diagnostics_divergence_patience=2,
+        )
+        encoder = nn.Identity()
+        encoder.cfg = SimpleNamespace(num_refine=2)
+        wrapper.encoder = encoder
+        wrapper._trainer = None
+        wrapper._diagnostic_divergence_streak = 0
+        wrapper._diagnostic_stop_reason = None
+
+        wrapper._update_divergence_guard(0.2, 0.1, ["healthy-scene"])
+        self.assertEqual(wrapper._diagnostic_divergence_streak, 0)
+        wrapper._update_divergence_guard(2.1, 1.1, ["bad-scene"])
+        self.assertIsNone(wrapper._diagnostic_stop_reason)
+        wrapper._update_divergence_guard(2.2, 1.2, ["bad-scene"])
+        self.assertIn("bad-scene", wrapper._diagnostic_stop_reason)
+
     def _make_dataset_root(self, root: Path) -> None:
         data_dir = root / "interp_12Hz_trainval"
         (data_dir / "bin_infos_3.2m").mkdir(parents=True)

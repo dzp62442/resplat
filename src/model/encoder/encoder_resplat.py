@@ -89,6 +89,9 @@ class EncoderReSplatCfg:
     train_min_refine: int
     train_max_refine: int
     num_basic_refine_blocks: int
+    refine_scale_update_mode: Literal["additive", "bounded_additive"]
+    refine_scale_delta_max: float
+    refine_scale_max: float | None
 
     # Refinement state
     state_channels: int
@@ -108,6 +111,7 @@ class EncoderReSplatCfg:
     use_amp: bool
     pt_head_amp: bool
     pt_update_amp: bool
+    refine_update_head_fp32: bool
 
     # Checkpointing
     use_checkpointing: bool
@@ -121,6 +125,50 @@ def _init_weights(m):
         nn.init.normal_(m.weight, std=.02)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
+
+
+def _apply_refine_scale_update(
+    previous_scales: Tensor,
+    raw_delta_scales: Tensor,
+    mode: Literal["additive", "bounded_additive"],
+    min_scale: float,
+    max_delta: float,
+    max_scale: float | None,
+) -> tuple[Tensor, Tensor]:
+    """Apply a refinement scale update and return its effective delta.
+
+    The original additive path is retained for checkpoint/config compatibility.
+    The bounded path preserves a unit slope around zero, while smoothly limiting
+    a single recurrent update so an outlier cannot inflate the covariance without
+    bound before gradient clipping gets a chance to run.
+    """
+    if mode == "additive":
+        updated_scales = (previous_scales + raw_delta_scales).clamp(
+            min=min_scale
+        )
+    elif mode == "bounded_additive":
+        if max_delta <= 0:
+            raise ValueError(
+                "refine_scale_delta_max must be positive when "
+                "refine_scale_update_mode=bounded_additive"
+            )
+        if max_scale is not None and max_scale <= min_scale:
+            raise ValueError("refine_scale_max must be greater than clamp_min_scale")
+
+        # max_delta * tanh(raw / max_delta) is approximately raw around zero,
+        # but caps the magnitude smoothly at max_delta for large head outputs.
+        bounded_delta_scales = max_delta * torch.tanh(
+            raw_delta_scales.float() / max_delta
+        )
+        updated_scales = torch.clamp(
+            previous_scales.float() + bounded_delta_scales,
+            min=min_scale,
+            max=max_scale,
+        )
+    else:
+        raise ValueError(f"Unknown refine scale update mode: {mode}")
+
+    return updated_scales, updated_scales - previous_scales
 
 
 def create_init_point_transformer(cfg, channels):
@@ -778,6 +826,7 @@ class EncoderReSplat(Encoder[EncoderReSplatCfg]):
         # check if the delta gaussian means and scales are becoming smaller over time
         delta_means_all = []
         delta_scales_all = []
+        applied_delta_scales_all = []
 
         b, v, _, h, w = context["image"].shape
 
@@ -1009,8 +1058,16 @@ class EncoderReSplat(Encoder[EncoderReSplatCfg]):
                     pxo = self.update_module[0]([point_cloud, concat, offset])
                     tmp_state = self.update_module[1](pxo, **refine_pt_kwargs) + tmp_state
 
-                # delta gaussian head
-                delta_gaussians = self.update_head(tmp_state)
+            # Running only this MLP in FP32 is substantially cheaper than
+            # disabling AMP for the point transformer, and protects the raw
+            # recurrent deltas from BF16 rounding near an unstable regime.
+            if self.cfg.refine_update_head_fp32:
+                with torch.amp.autocast(device_type='cuda', enabled=False):
+                    delta_gaussians = self.update_head(tmp_state.float())
+            else:
+                with torch.amp.autocast(device_type='cuda', enabled=self.cfg.pt_update_amp, dtype=torch.bfloat16):
+                    # delta gaussian head
+                    delta_gaussians = self.update_head(tmp_state)
 
             # update gaussian parameters
             delta_gaussians = rearrange(delta_gaussians, "(b n) c -> b n c", b=b)
@@ -1035,8 +1092,15 @@ class EncoderReSplat(Encoder[EncoderReSplatCfg]):
 
             prev_means = (prev_means + delta_means)
 
-            # clamp the scale
-            prev_scales = (prev_scales + delta_scales).clamp(min=self.cfg.gaussian_adapter.clamp_min_scale)
+            raw_delta_scales = delta_scales
+            prev_scales, applied_delta_scales = _apply_refine_scale_update(
+                prev_scales,
+                raw_delta_scales,
+                self.cfg.refine_scale_update_mode,
+                self.cfg.gaussian_adapter.clamp_min_scale,
+                self.cfg.refine_scale_delta_max,
+                self.cfg.refine_scale_max,
+            )
 
             prev_rotations_unnorm = prev_rotations_unnorm + delta_rotations
             # normalize
@@ -1067,7 +1131,10 @@ class EncoderReSplat(Encoder[EncoderReSplatCfg]):
             )
 
             delta_means_all.append(delta_means)
-            delta_scales_all.append(delta_scales)
+            # Preserve the original raw-head diagnostic and separately expose
+            # the scale update that was actually applied after stabilization.
+            delta_scales_all.append(raw_delta_scales)
+            applied_delta_scales_all.append(applied_delta_scales)
 
             gaussian_output.append(prev_gaussians)
 
@@ -1100,6 +1167,7 @@ class EncoderReSplat(Encoder[EncoderReSplatCfg]):
             'render_input': render_input_views,
             'delta_means': delta_means_all,
             'delta_scales': delta_scales_all,
+            'applied_delta_scales': applied_delta_scales_all,
             'final_state': tmp_state,  # [BVHW, C], for sliding window global fusion
         }
     
@@ -1124,5 +1192,4 @@ class EncoderReSplat(Encoder[EncoderReSplatCfg]):
 def RGB2SH(rgb):
     C0 = 0.28209479177387814
     return (rgb - 0.5) / C0
-
 

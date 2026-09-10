@@ -36,6 +36,7 @@ class TrainerCfg:
     max_steps: int
     val_check_interval: int | float | None
     gradient_clip_val: int | float | None
+    log_every_n_steps: int
     num_sanity_val_steps: int
     num_nodes: int
     eval_index: str | None
