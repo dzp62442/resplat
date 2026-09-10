@@ -101,7 +101,8 @@ class TestOmniScene(unittest.TestCase):
             diagnostics_log_every_n_steps=0,
             diagnostics_stop_on_divergence=True,
             diagnostics_scale_mean_threshold=2.0,
-            diagnostics_delta_scale_mean_threshold=1.0,
+            diagnostics_delta_scale_mean_threshold=0.25,
+            diagnostics_raw_scale_saturation_fraction_threshold=0.25,
             diagnostics_divergence_patience=2,
         )
         encoder = nn.Identity()
@@ -111,12 +112,29 @@ class TestOmniScene(unittest.TestCase):
         wrapper._diagnostic_divergence_streak = 0
         wrapper._diagnostic_stop_reason = None
 
-        wrapper._update_divergence_guard(0.2, 0.1, ["healthy-scene"])
+        wrapper._update_divergence_guard(0.2, 0.1, 0.1, ["healthy-scene"])
         self.assertEqual(wrapper._diagnostic_divergence_streak, 0)
-        wrapper._update_divergence_guard(2.1, 1.1, ["bad-scene"])
+        wrapper._update_divergence_guard(2.1, 0.3, 0.3, ["bad-scene"])
         self.assertIsNone(wrapper._diagnostic_stop_reason)
-        wrapper._update_divergence_guard(2.2, 1.2, ["bad-scene"])
+        wrapper._update_divergence_guard(2.2, 0.3, 0.3, ["bad-scene"])
         self.assertIn("bad-scene", wrapper._diagnostic_stop_reason)
+
+    def test_refine_raw_scale_regularization(self) -> None:
+        small = torch.tensor([0.0, 0.05, -0.05], requires_grad=True)
+        saturated = torch.tensor([0.0, 1.0, -1.0], requires_grad=True)
+
+        small_loss = ModelWrapper._refine_raw_scale_regularization(
+            [small], max_delta=0.5
+        )
+        saturated_loss = ModelWrapper._refine_raw_scale_regularization(
+            [saturated], max_delta=0.5
+        )
+
+        self.assertGreater(saturated_loss.item(), small_loss.item() * 100)
+        saturated_loss.backward()
+        self.assertTrue(torch.isfinite(saturated.grad).all())
+        self.assertGreater(saturated.grad[1].item(), 0)
+        self.assertLess(saturated.grad[2].item(), 0)
 
     def _make_dataset_root(self, root: Path) -> None:
         data_dir = root / "interp_12Hz_trainval"

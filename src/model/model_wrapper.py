@@ -156,11 +156,16 @@ class TrainCfg:
     # Ignore dynamic-object pixels in target-view training losses.
     use_dynamic_mask: bool
 
+    # Penalize raw scale logits before they enter the bounded update. This keeps
+    # the tanh derivative useful instead of allowing hidden saturation.
+    refine_raw_scale_regularization_weight: float
+
     # Refinement-only observability and fail-safe controls.
     diagnostics_log_every_n_steps: int
     diagnostics_stop_on_divergence: bool
     diagnostics_scale_mean_threshold: float
     diagnostics_delta_scale_mean_threshold: float
+    diagnostics_raw_scale_saturation_fraction_threshold: float
     diagnostics_divergence_patience: int
 
 
@@ -286,6 +291,27 @@ class ModelWrapper(LightningModule):
                 )
 
         return total_norm
+
+    @staticmethod
+    def _refine_raw_scale_regularization(
+        raw_delta_scales: list[Tensor],
+        max_delta: float,
+    ) -> Tensor:
+        """Regularize bounded scale logits in units of one update limit."""
+        if max_delta <= 0:
+            raise ValueError("refine_scale_delta_max must be positive")
+        if not raw_delta_scales:
+            raise ValueError("raw_delta_scales must not be empty")
+
+        losses = [
+            F.smooth_l1_loss(
+                raw_delta.float() / max_delta,
+                torch.zeros_like(raw_delta, dtype=torch.float32),
+                beta=1.0,
+            )
+            for raw_delta in raw_delta_scales
+        ]
+        return torch.stack(losses).mean()
 
     def on_before_optimizer_step(self, optimizer: optim.Optimizer) -> None:
         if not self._diagnostics_enabled():
@@ -415,7 +441,8 @@ class ModelWrapper(LightningModule):
     def _update_divergence_guard(
         self,
         gaussian_scale_mean: float,
-        last_delta_scale_mean: float,
+        last_applied_delta_scale_mean: float,
+        last_raw_scale_saturation_fraction: float,
         scene_names: list[str],
     ) -> None:
         if not self.train_cfg.diagnostics_stop_on_divergence:
@@ -423,11 +450,14 @@ class ModelWrapper(LightningModule):
 
         over_threshold = (
             not math.isfinite(gaussian_scale_mean)
-            or not math.isfinite(last_delta_scale_mean)
+            or not math.isfinite(last_applied_delta_scale_mean)
+            or not math.isfinite(last_raw_scale_saturation_fraction)
             or gaussian_scale_mean
             > self.train_cfg.diagnostics_scale_mean_threshold
-            or last_delta_scale_mean
+            or last_applied_delta_scale_mean
             > self.train_cfg.diagnostics_delta_scale_mean_threshold
+            or last_raw_scale_saturation_fraction
+            > self.train_cfg.diagnostics_raw_scale_saturation_fraction_threshold
         )
         self._diagnostic_divergence_streak = (
             self._diagnostic_divergence_streak + 1 if over_threshold else 0
@@ -448,7 +478,10 @@ class ModelWrapper(LightningModule):
             self._diagnostic_stop_reason = (
                 "recurrent Gaussian scale runaway: "
                 f"scale_mean={gaussian_scale_mean:.6g}, "
-                f"last_delta_scale_mean={last_delta_scale_mean:.6g}, "
+                "last_applied_delta_scale_mean="
+                f"{last_applied_delta_scale_mean:.6g}, "
+                "last_raw_scale_saturation_fraction="
+                f"{last_raw_scale_saturation_fraction:.6g}, "
                 f"streak={self._diagnostic_divergence_streak}, "
                 f"step={self.global_step}, "
                 f"scene={','.join(scene_names)}"
@@ -626,6 +659,28 @@ class ModelWrapper(LightningModule):
                 'applied_delta_scales', delta_scales
             )
 
+            regularization_weight = (
+                self.train_cfg.refine_raw_scale_regularization_weight
+            )
+            if regularization_weight > 0:
+                raw_scale_regularization = (
+                    self._refine_raw_scale_regularization(
+                        delta_scales,
+                        self.encoder.cfg.refine_scale_delta_max,
+                    )
+                )
+                weighted_raw_scale_regularization = (
+                    regularization_weight * raw_scale_regularization
+                )
+                self.log(
+                    "loss/refine_raw_scale_regularization_unweighted",
+                    raw_scale_regularization,
+                )
+                self.log(
+                    "loss/refine_raw_scale_regularization",
+                    weighted_raw_scale_regularization,
+                )
+
             # the last output
             output = render_output[-1]
             gaussians = gaussian_output[-1]
@@ -690,6 +745,11 @@ class ModelWrapper(LightningModule):
 
         # Compute and log loss.
         total_loss = 0
+
+        if self.encoder.cfg.num_refine > 0 and (
+            self.train_cfg.refine_raw_scale_regularization_weight > 0
+        ):
+            total_loss = total_loss + weighted_raw_scale_regularization
 
         valid_depth_mask = _get_target_invalid_mask(
             batch, target_gt, self.train_cfg.use_dynamic_mask
@@ -954,6 +1014,8 @@ class ModelWrapper(LightningModule):
             )
             num_output = len(delta_means)
             delta_scale_means = []
+            applied_delta_scale_means = []
+            raw_scale_saturation_fractions = []
             # delta means
             if isinstance(delta_means[0], torch.Tensor):
                 for i in range(num_output):
@@ -973,9 +1035,21 @@ class ModelWrapper(LightningModule):
                         f"update{i}/applied_delta_scales_mean",
                         applied_delta_scales[i].abs().mean().item(),
                     )
+                    applied_delta_scale_means.append(
+                        applied_delta_scales[i].abs().mean().item()
+                    )
                     self.log(
                         f"update{i}/applied_delta_scales_max",
                         applied_delta_scales[i].abs().max().item(),
+                    )
+                    saturation_fraction = (
+                        delta_scales[i].detach().abs()
+                        >= self.encoder.cfg.refine_scale_delta_max
+                    ).float().mean().item()
+                    raw_scale_saturation_fractions.append(saturation_fraction)
+                    self.log(
+                        f"update{i}/raw_scale_saturation_fraction",
+                        saturation_fraction,
                     )
 
         gaussian_scale_min = gaussians.scales.min().item()
@@ -985,10 +1059,11 @@ class ModelWrapper(LightningModule):
         self.log("info/gaussian_scale_max", gaussian_scale_max)
         self.log("info/gaussian_scale_mean", gaussian_scale_mean)
 
-        if self.encoder.cfg.num_refine > 0 and delta_scale_means:
+        if self.encoder.cfg.num_refine > 0 and applied_delta_scale_means:
             self._update_divergence_guard(
                 gaussian_scale_mean,
-                delta_scale_means[-1],
+                applied_delta_scale_means[-1],
+                raw_scale_saturation_fractions[-1],
                 batch["scene"],
             )
 

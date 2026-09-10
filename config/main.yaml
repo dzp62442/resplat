@@ -76,12 +76,17 @@ train:
   half_res_lpips_loss: false
   use_dynamic_mask: false
 
+  # Keep the raw refinement scale logits near the non-saturated region of the
+  # bounded update. Disabled by default for released experiment compatibility.
+  refine_raw_scale_regularization_weight: 0.0
+
   # Optional refinement diagnostics. Disabled by default so existing
   # experiments keep their original logging and stopping behavior.
   diagnostics_log_every_n_steps: 0
   diagnostics_stop_on_divergence: false
   diagnostics_scale_mean_threshold: 2.0
   diagnostics_delta_scale_mean_threshold: 1.0
+  diagnostics_raw_scale_saturation_fraction_threshold: 1.0
   diagnostics_divergence_patience: 2
 
 test:
