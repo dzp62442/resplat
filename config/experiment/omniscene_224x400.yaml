@@ -25,6 +25,7 @@ trainer:
 
 train:
   eval_model_every_n_val: 10
+  eval_final_mini: true
   eval_data_length: 2048
   use_dynamic_mask: true
 

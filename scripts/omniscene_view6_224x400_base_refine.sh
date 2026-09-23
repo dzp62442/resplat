@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 <omniscene-init-checkpoint>" >&2
-    exit 2
-fi
-
-init_checkpoint="$1"
+source "$(dirname "${BASH_SOURCE[0]}")/omniscene_stage_args.sh" refine 224x400 "$@"
 
 # Refine trains only encoder.update* for the remaining 33_334 optimizer steps.
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python -m src.main \
@@ -27,7 +22,7 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python -m src.main \
     optimizer.lr_monodepth=0. \
     checkpointing.every_n_train_steps=500 \
     checkpointing.load=null \
-    checkpointing.pretrained_model="${init_checkpoint}" \
+    checkpointing.pretrained_model="${omniscene_init_checkpoint}" \
     checkpointing.no_strict_load=true \
     checkpointing.resume=false \
     checkpointing.resume_update_module=null \
@@ -43,4 +38,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python -m src.main \
     trainer.log_every_n_steps=10 \
     train.eval_model_every_n_val=10 \
     wandb.project=omniscene-view6-224x400 \
-    output_dir=checkpoints/resplat/omniscene-view6-224x400/base-refine
+    output_dir="${omniscene_output_dir}" \
+    "${omniscene_overrides[@]}"

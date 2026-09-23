@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/omniscene_stage_args.sh" init 224x400 "$@"
+
 # Fresh OmniScene Init training: 66_667 of the total 100_001 optimizer steps.
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python -m src.main \
     +experiment=omniscene_224x400 \
@@ -20,4 +22,5 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" python -m src.main \
     trainer.val_check_interval=0.01 \
     train.eval_model_every_n_val=10 \
     wandb.project=omniscene-view6-224x400 \
-    output_dir=checkpoints/resplat/omniscene-view6-224x400/base-init
+    output_dir="${omniscene_output_dir}" \
+    "${omniscene_overrides[@]}"

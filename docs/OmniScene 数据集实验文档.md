@@ -12,6 +12,7 @@
   - 合计：`66_667 + 33_334 = 100_001` steps。
 - `trainer.val_check_interval=0.01`，即每训练 `0.01` 个 epoch 触发一次 validation。它是 epoch 比例，不应写死解释成固定的 1k steps；实际 step 间隔取决于训练集长度、GPU 数量和分布式采样。
 - `train.eval_model_every_n_val=10`，即每 10 次 validation 运行一次定量监控测试。ReSplat 已有该字段和调用逻辑，不需要忽略。
+- `train.eval_final_mini=true`：Init 与 Refine 正常达到各自目标步数后，各额外运行一次完整 mini 评估；不依赖周期 validation 次数，恢复训练后也会执行。
 - `train.use_dynamic_mask=true`，动态物体区域只在训练损失中排除；正式测试的 PSNR、SSIM、LPIPS、PCC 仍按现有对比口径在完整图像上计算。
 - 主表使用完整的官方 OmniScene test split，即完整读取 `bins_val_3.2m.json`，不做 `[0::14][:2048]` 抽样，也不使用 Center150。Center150 属于基于优化的方法对比，不在本次前馈高斯主实验范围内。
 
@@ -133,6 +134,28 @@ ReSplat 原始 `config/experiment/re10k.yaml` 用 `trainer.max_steps=300_001` �
 Refine 不是 Init 之后在同一个 Trainer 内继续累计 step，而是新建 Trainer、载入 Init checkpoint、冻结基础 encoder，再从 stage-local step 0 训练 update 模块。因此最终 checkpoint 的 Lightning `global_step` 约为 `33_334`，论文中的训练预算需要按两个阶段外部求和为 `100_001`。
 
 原项目的周期 checkpoint 每 1000 step 保存一次，而 Lightning 的 `ModelCheckpoint.on_train_end` 不会自动补存非整千的结束 step。当前分支增加了 final-checkpoint callback：Init 正常结束后固定保存 `checkpoints/final-step_66667.ckpt`，Refine 正常结束后固定保存 `checkpoints/final-step_33334.ckpt`，从而保证阶段交接和最终测试使用精确预算对应的权重，而不是误用 66,000/33,000-step 周期 checkpoint。
+
+阶段结束 mini 由 `ModelWrapper.on_train_end` 执行。Lightning 先调用 `FinalCheckpoint` 保存权重，再调用模型 hook；只有 `global_step == trainer.max_steps`、未中断且未触发诊断停止时，才用与已保存 checkpoint 完全相同的模型状态，在 `eval()` / `torch.inference_mode()` 下评估完整 mini。它不受 `train.eval_data_length` 的周期测试上限影响，即使 `eval_model_every_n_val=0` 也可单独开启。
+
+结果写入本阶段目录的 `mini-final-step_<step>/metrics/`：四项逐样本 JSON、`scores_all_avg.json` 和包含权重路径/步数/样本数/scene 列表的 `evaluation.json`。四项分数必须全部有限且条数等于 mini 数据集长度才会发布汇总。W&B 同步更新 `test/*` 并额外记录 `final_mini/*`，避免把旧的周期测试分数误认为最终权重结果。mini 仍不作为主表的完整 test 指标。
+
+周期评估用的 `eval_cnt` 现在由 `on_save_checkpoint` / `on_load_checkpoint` 保存与恢复；旧 checkpoint 没有该字段时从 0 开始，阶段结束 mini 仍不受影响。
+
+### 使用后缀重复实验
+
+四个 OmniScene 阶段脚本都支持可选后缀（例如 `_1`、`_2`）和末尾的 Hydra `key=value` 覆盖：
+
+```bash
+conda activate resplat
+bash scripts/omniscene_view6_112x200_base_init.sh _1 && \
+bash scripts/omniscene_view6_112x200_base_refine.sh _1
+```
+
+对应输出为 `checkpoints/resplat/omniscene-view6-112x200/base-init_1` / `base-refine_1`，W&B 名称跟随目录名。Refine 默认加载 `base-init_1/checkpoints/final-step_66667.ckpt`；也保留显式用法 `bash scripts/omniscene_view6_112x200_base_refine.sh <init.ckpt> _1`。224x400 使用对应脚本。无后缀仍使用原来的目录，已有非空输出目录会拒绝新训练，恢复时需显式传入恢复配置。
+
+后缀不修改随机种子。若要做多 seed 实验，两个阶段都显式传入同一组 `seed`、`data_loader.train.seed`；若希望固定 seed 重复，只改变后缀即可。每次完整重复仍重新完成 Init 与 Refine，合计 `100_001` 步。
+
+当前 Refine 脚本从第 0 步启用 `bounded_additive`、`refine_scale_delta_max=0.5`、`refine_scale_max=4.0`、`refine_update_head_fp32=true` 和 `train.refine_raw_scale_regularization_weight=0.01`。历史成功修复 run 的正则从 20,500 步后才启用，新重复实验应明确使用当前固定方案。
 
 这里的“从头训练”具体定义为：
 
@@ -276,6 +299,11 @@ CUDA_VISIBLE_DEVICES=<gpu> python -m src.main +experiment=omniscene_112x200 \
     model.encoder.num_refine=2 \
     model.encoder.refine_same_num_points=true \
     model.encoder.recurrent_use_checkpointing=true \
+    model.encoder.refine_scale_update_mode=bounded_additive \
+    model.encoder.refine_scale_delta_max=0.5 \
+    model.encoder.refine_scale_max=4.0 \
+    model.encoder.refine_update_head_fp32=true \
+    train.refine_raw_scale_regularization_weight=0.01 \
     optimizer.lr=1e-4 \
     optimizer.lr_monodepth=0. \
     checkpointing.load=null \
@@ -305,6 +333,10 @@ CUDA_VISIBLE_DEVICES=<gpu> python -m src.main +experiment=omniscene_112x200 \
     model.encoder.num_refine=2 \
     model.encoder.refine_same_num_points=true \
     checkpointing.pretrained_model=<refine_checkpoint> \
+    model.encoder.refine_scale_update_mode=bounded_additive \
+    model.encoder.refine_scale_delta_max=0.5 \
+    model.encoder.refine_scale_max=4.0 \
+    model.encoder.refine_update_head_fp32=true \
     test.compute_scores=true \
     output_dir=outputs/resplat-omniscene-112x200-base-refine-total
 ```

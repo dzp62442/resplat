@@ -10,6 +10,7 @@ import torch
 import wandb
 from einops import pack, rearrange, repeat
 from jaxtyping import Float
+from omegaconf import OmegaConf
 from pytorch_lightning import LightningModule
 from pytorch_lightning.loggers.wandb import WandbLogger
 from pytorch_lightning.utilities import rank_zero_only
@@ -30,12 +31,14 @@ from ..evaluation.metrics import (
     compute_psnr,
     compute_ssim,
 )
+from ..evaluation.final_mini import save_final_mini_scores
 from ..global_cfg import get_cfg
 from ..loss import Loss
 from ..misc.benchmarker import Benchmarker
 from ..misc.image_io import prep_image, save_image, save_video
 from ..misc.LocalLogger import LOG_PATH, LocalLogger
 from ..misc.step_tracker import StepTracker
+from ..misc.final_checkpoint import get_final_checkpoint_path
 from ..visualization.annotation import add_label
 from ..visualization.camera_trajectory.interpolation import (
     interpolate_extrinsics,
@@ -128,6 +131,7 @@ class TrainCfg:
     extended_visualization: bool
     print_log_every_n_steps: int
     eval_model_every_n_val: int
+    eval_final_mini: bool
     eval_data_length: int
     eval_deterministic: bool
     eval_time_skip_steps: int
@@ -235,6 +239,52 @@ class ModelWrapper(LightningModule):
             self.encoder.cfg.num_refine > 0
             and self.train_cfg.diagnostics_log_every_n_steps > 0
         )
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        checkpoint["eval_cnt"] = self.eval_cnt
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        # Older checkpoints did not persist this counter.
+        self.eval_cnt = int(checkpoint.get("eval_cnt", 0))
+
+    def on_train_end(self) -> None:
+        if not self.train_cfg.eval_final_mini:
+            return
+        if (
+            self.trainer.interrupted
+            or self.trainer.max_steps <= 0
+            or self.global_step != self.trainer.max_steps
+            or self._diagnostic_stop_reason is not None
+        ):
+            if self.trainer.is_global_zero:
+                print("Skipping final mini evaluation: stage did not complete normally.")
+            return
+        if self.eval_data_cfg is None or (
+            self.eval_data_cfg.name != "omniscene"
+            or self.eval_data_cfg.test_split != "mini"
+        ):
+            raise RuntimeError("Stage-final evaluation requires the OmniScene mini split")
+
+        # Lightning calls callback.on_train_end before module.on_train_end, so
+        # FinalCheckpoint has saved these exact post-optimizer model weights.
+        checkpoint = get_final_checkpoint_path(
+            Path(get_cfg()["output_dir"]) / "checkpoints", self.global_step
+        )
+        self.trainer.strategy.barrier()
+        if self.trainer.is_global_zero:
+            if not checkpoint.is_file():
+                raise FileNotFoundError(f"Final checkpoint was not saved: {checkpoint}")
+            output_dir = checkpoint.parent.parent / f"mini-final-step_{self.global_step}"
+            print(f"Running final mini evaluation for {checkpoint}")
+            was_training = self.training
+            self.eval()
+            try:
+                with torch.inference_mode():
+                    self.run_full_test_sets_eval(final_output_dir=output_dir)
+            finally:
+                self.train(was_training)
+        # Keep other ranks alive until rank zero finishes the unsharded mini set.
+        self.trainer.strategy.barrier()
 
     def _should_log_diagnostics(self) -> bool:
         interval = self.train_cfg.diagnostics_log_every_n_steps
@@ -1853,7 +1903,11 @@ class ModelWrapper(LightningModule):
         if self.trainer.sanity_checking and self.global_rank == 0:
             print(self.encoder)  # log the model to wandb log files
 
-        if (not self.trainer.sanity_checking) and (self.eval_data_cfg is not None):
+        if (
+            not self.trainer.sanity_checking
+            and self.eval_data_cfg is not None
+            and self.train_cfg.eval_model_every_n_val > 0
+        ):
             self.eval_cnt = self.eval_cnt + 1
             if self.eval_cnt % self.train_cfg.eval_model_every_n_val == 0:
                 # backup current ckpt before running full test sets eval
@@ -1886,7 +1940,7 @@ class ModelWrapper(LightningModule):
                 self.run_full_test_sets_eval()
 
     @rank_zero_only
-    def run_full_test_sets_eval(self) -> None:
+    def run_full_test_sets_eval(self, final_output_dir: Path | None = None) -> None:
         start_t = time.time()
 
         pred_depths = None
@@ -1895,6 +1949,12 @@ class ModelWrapper(LightningModule):
         full_testsets = self.trainer.datamodule.test_dataloader(
             dataset_cfg=self.eval_data_cfg
         )
+        # Final evaluation always covers the entire mini split, even when a
+        # smaller periodic monitoring limit was requested during training.
+        eval_length = len(full_testsets) if final_output_dir is not None else min(
+            len(full_testsets), self.train_cfg.eval_data_length
+        )
+        scene_names = []
         scores_dict = {}
 
         for score_tag in ("psnr", "ssim", "lpips", "pcc"):
@@ -1916,9 +1976,9 @@ class ModelWrapper(LightningModule):
         time_skip_steps_dict = {"encoder": 0, "decoder": 0}
         for batch_idx, batch in tqdm(
             enumerate(full_testsets),
-            total=min(len(full_testsets), self.train_cfg.eval_data_length),
+            total=eval_length,
         ):
-            if batch_idx >= self.train_cfg.eval_data_length:
+            if batch_idx >= eval_length:
                 break
 
             batch = self.data_shim(batch)
@@ -1927,6 +1987,8 @@ class ModelWrapper(LightningModule):
             # Render Gaussians.
             b, v, _, h, w = batch["target"]["image"].shape
             assert b == 1
+            if final_output_dir is not None:
+                scene_names.extend(batch["scene"])
             if batch_idx < time_skip_first_n_steps:
                 time_skip_steps_dict["encoder"] += 1
                 time_skip_steps_dict["decoder"] += v
@@ -2141,22 +2203,56 @@ class ModelWrapper(LightningModule):
                 scores_dict["rmse"]["probabilistic"].append(all_metrics[2])
                 scores_dict["a1"]["probabilistic"].append(all_metrics[4])
 
-        # summarise scores and log to logger
+        # Summarise scores. self.log is allowed during validation, but not from
+        # on_train_end; stage-final metrics use the logger directly below.
+        logged_scores = {}
         for score_tag, methods in scores_dict.items():
             for method_tag, cur_scores in methods.items():
                 if len(cur_scores) > 0:
                     cur_mean = sum(cur_scores) / len(cur_scores)
-                    self.log(f"test/{score_tag}", cur_mean)
+                    logged_scores[f"test/{score_tag}"] = cur_mean
         # summarise run time
         for tag, times in self.benchmarker.execution_times.items():
             times = times[int(time_skip_steps_dict[tag]) :]
-            print(f"{tag}: {len(times)} calls, avg. {np.mean(times)} seconds per call")
-            self.log(f"test/runtime_avg_{tag}", np.mean(times))
+            if times:
+                average_time = float(np.mean(times))
+                print(f"{tag}: {len(times)} calls, avg. {average_time} seconds per call")
+                logged_scores[f"test/runtime_avg_{tag}"] = average_time
         self.benchmarker.clear_history()
 
         overall_eval_time = time.time() - start_t
         print(f"Eval total time cost: {overall_eval_time:.3f}s")
-        self.log("test/runtime_all", overall_eval_time)
+        logged_scores["test/runtime_all"] = overall_eval_time
+        if final_output_dir is None:
+            self.log_dict(logged_scores)
+        else:
+            checkpoint = get_final_checkpoint_path(
+                Path(get_cfg()["output_dir"]) / "checkpoints", self.global_step
+            )
+            summary = save_final_mini_scores(
+                final_output_dir / "metrics",
+                {name: methods["probabilistic"] for name, methods in scores_dict.items()},
+                len(full_testsets.dataset),
+                {
+                    "checkpoint": str(checkpoint.resolve()),
+                    "global_step": self.global_step,
+                    "num_refine": self.encoder.cfg.num_refine,
+                    "target_views": v if scene_names else 0,
+                    "scenes": scene_names,
+                    "runtime_seconds": overall_eval_time,
+                },
+            )
+            OmegaConf.save(get_cfg(), final_output_dir / "config.yaml")
+            # Update test/* so W&B's latest test scores refer to the final model;
+            # keep a separate namespace to distinguish them from periodic tests.
+            logged_scores.update({f"test/{name}": value for name, value in summary.items()})
+            logged_scores.update({f"final_mini/{name}": value for name, value in summary.items()})
+            logged_scores["final_mini/global_step"] = self.global_step
+            logged_scores["final_mini/sample_count"] = len(full_testsets.dataset)
+            if self.logger is not None:
+                self.logger.log_metrics(logged_scores, step=self.global_step)
+            print(f"Final mini scores (step {self.global_step}): {summary}")
+            print(f"Saved final mini results to {final_output_dir / 'metrics'}")
 
     @rank_zero_only
     def render_video_wobble(self, batch: BatchedExample) -> None:

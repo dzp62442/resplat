@@ -50,7 +50,11 @@ def cyan(text: str) -> str:
     config_name="main",
 )
 def train(cfg_dict: DictConfig):
-    if cfg_dict["mode"] == "train" and cfg_dict["train"]["eval_model_every_n_val"] > 0:
+    if cfg_dict.train.eval_final_mini and cfg_dict.dataset.name != "omniscene":
+        raise ValueError("train.eval_final_mini requires dataset=omniscene")
+    if cfg_dict["mode"] == "train" and (
+        cfg_dict.train.eval_model_every_n_val > 0 or cfg_dict.train.eval_final_mini
+    ):
         eval_cfg_dict = copy.deepcopy(cfg_dict)
         if cfg_dict["dataset"]["name"] == "omniscene":
             # Use a fixed lightweight subset for quantitative monitoring during

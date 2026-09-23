@@ -58,6 +58,7 @@ train:
   extended_visualization: false
   print_log_every_n_steps: 100
   eval_model_every_n_val: 2
+  eval_final_mini: false
   eval_data_length: 999999
   eval_deterministic: false
   eval_time_skip_steps: 3
