@@ -39,7 +39,7 @@ class TestTrainQueue(unittest.TestCase):
         (dataset / "bins_val_3.2m.json").write_text(json.dumps({"bins": [f"scene-{i}" for i in range(28)]}))
         cfg = {
             "dataset": {"name": "omniscene", "roots": [str(dataset.parent)], "test_split": "total"},
-            "model": {"encoder": {"num_refine": 2}}, "optimizer": {"lr": 1e-4},
+            "model": {"encoder": {"num_refine": 1}}, "optimizer": {"lr": 1e-4},
             "loss": {"mse": {}}, "seed": 123,
             "trainer": {"max_steps": 10},
             "train": {"eval_final_mini": True, "final_mini_only": False, "use_dynamic_mask": True},
@@ -69,7 +69,8 @@ class TestTrainQueue(unittest.TestCase):
         save_final_mini_scores(self.job.metrics,
             {name: [0.5, 0.7] for name in ("psnr", "ssim", "lpips", "pcc")}, 2,
             {"checkpoint": str(self.job.final_checkpoint), "global_step": 10,
-             "num_refine": 2, "target_views": 18, "scenes": ["scene-0", "scene-14"]})
+             "num_refine": self.job.cfg["model"]["encoder"]["num_refine"],
+             "target_views": 18, "scenes": ["scene-0", "scene-14"]})
 
     def test_commands_and_environment(self):
         path = self.root / "train.sh"
@@ -157,6 +158,13 @@ class TestTrainQueue(unittest.TestCase):
         self.checkpoint(3)
         self.job.cfg["checkpointing"]["pretrained_model"] = "another-init.ckpt"
         with self.assertRaisesRegex(ValueError, "初始权重来源"):
+            plan_job(self.job)
+
+    def test_single_update_does_not_resume_a_two_update_experiment(self):
+        self.job.cfg["model"]["encoder"]["num_refine"] = 2
+        self.checkpoint(3)
+        self.job.cfg["model"]["encoder"]["num_refine"] = 1
+        with self.assertRaisesRegex(ValueError, "训练配置"):
             plan_job(self.job)
 
     def test_missing_config_is_not_silently_adopted(self):

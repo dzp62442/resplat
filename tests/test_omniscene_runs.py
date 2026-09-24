@@ -75,7 +75,7 @@ class TestOmniSceneRuns(unittest.TestCase):
     def test_both_stages_evaluate_exact_final_state_and_resume_counter(self):
         previous_cfg = get_cfg()
         try:
-            for num_refine in (0, 2):
+            for num_refine in (0, 1, 2):
                 with self.subTest(num_refine=num_refine), tempfile.TemporaryDirectory() as tmp:
                     directory = Path(tmp)
                     set_cfg(OmegaConf.create({"output_dir": tmp}))
@@ -145,7 +145,7 @@ class TestOmniSceneRuns(unittest.TestCase):
             for i in range(2)
         ]
         try:
-            for num_refine in (0, 2):
+            for num_refine in (0, 1, 2):
                 with self.subTest(num_refine=num_refine), tempfile.TemporaryDirectory() as tmp:
                     set_cfg(OmegaConf.create({"output_dir": tmp}))
                     wrapper = ModelWrapper.__new__(ModelWrapper)
@@ -155,7 +155,8 @@ class TestOmniSceneRuns(unittest.TestCase):
                     wrapper.encoder.forward = Mock(return_value={
                         "gaussians": None, "depths": None, "condition_features": None,
                     })
-                    wrapper.encoder.forward_update = Mock(return_value={"render": [init_render, refined_render]})
+                    renders = [init_render] * max(num_refine - 1, 0) + [refined_render] if num_refine else []
+                    wrapper.encoder.forward_update = Mock(return_value={"render": renders})
                     wrapper.decoder = SimpleNamespace(forward=Mock(return_value=init_render))
                     wrapper.eval_data_cfg = SimpleNamespace(name="omniscene", test_split="mini")
                     wrapper.train_cfg = SimpleNamespace(
@@ -182,6 +183,7 @@ class TestOmniSceneRuns(unittest.TestCase):
                     metadata = json.loads((out / "metrics/evaluation.json").read_text())
                     self.assertEqual(metadata["scenes"], ["scene-0", "scene-1"])
                     self.assertEqual(metadata["target_views"], 18)
+                    self.assertEqual(metadata["num_refine"], num_refine)
                     logged = logger.log_metrics.call_args.args[0]
                     self.assertAlmostEqual(logged["final_mini/pcc"], 1.0)
                     self.assertEqual(logged["test/psnr"], logged["final_mini/psnr"])
@@ -218,12 +220,24 @@ class TestOmniSceneRuns(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f"output_dir={root}/base-{stage}_1\n", result.stdout)
                 self.assertIn("seed=123\n", result.stdout)
+                self.assertIn(f"model.encoder.num_refine={int(stage == 'refine')}\n", result.stdout)
                 if stage == "refine":
                     self.assertIn(f"checkpointing.pretrained_model={root}/base-init_1/checkpoints/final-step_66667.ckpt\n", result.stdout)
                     self.assertIn("train.refine_raw_scale_regularization_weight=0.01\n", result.stdout)
             legacy = self._script(resolution, "refine", "/tmp/explicit.ckpt", "_2", "--cfg", "job")
             self.assertEqual(legacy.returncode, 0, legacy.stderr)
             self.assertIn("checkpointing.pretrained_model=/tmp/explicit.ckpt\n", legacy.stdout)
+
+    def test_omniscene_defaults_to_one_update_and_allows_legacy_override(self):
+        for resolution in ("112x200", "224x400"):
+            cfg = OmegaConf.load(ROOT / "config" / "experiment" / f"omniscene_{resolution}.yaml")
+            self.assertEqual(cfg.model.encoder.num_refine, 1)
+            self.assertEqual(cfg.model.encoder.train_min_refine, 0)
+            self.assertEqual(cfg.model.encoder.train_max_refine, 0)
+            result = self._script(resolution, "refine", "_legacy", "model.encoder.num_refine=2", "--cfg", "job")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = result.stdout.splitlines()
+            self.assertLess(args.index("model.encoder.num_refine=1"), args.index("model.encoder.num_refine=2"))
 
     def test_existing_run_and_missing_init_fail_before_launch(self):
         with tempfile.TemporaryDirectory() as tmp:

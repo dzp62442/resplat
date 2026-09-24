@@ -32,6 +32,10 @@ train:
 model:
   encoder:
     num_depth_candidates: 128
+    # OmniScene uses one refinement update for training and evaluation.
+    num_refine: 1
+    train_min_refine: 0
+    train_max_refine: 0
     # Keep the Init base topology identical to Refine so every base weight can
     # be transferred; Init still disables the recurrent module (num_refine=0).
     latent_downsample: 2

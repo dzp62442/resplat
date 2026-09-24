@@ -10,6 +10,7 @@
   - Init：`66_667` steps；
   - Refine：`33_334` steps；
   - 合计：`66_667 + 33_334 = 100_001` steps。
+- OmniScene 默认使用单轮 Refine（训练、mini 与完整 test 均为 `model.encoder.num_refine=1`）；Init 仍为 `0`，不改变 RE10K 等原始数据集的轮数设置。
 - `trainer.val_check_interval=0.01`，即每训练 `0.01` 个 epoch 触发一次 validation。它是 epoch 比例，不应写死解释成固定的 1k steps；实际 step 间隔取决于训练集长度、GPU 数量和分布式采样。
 - `train.eval_model_every_n_val=10`，即每 10 次 validation 运行一次定量监控测试。ReSplat 已有该字段和调用逻辑，不需要忽略。
 - `train.eval_final_mini=true`：Init 与 Refine 正常达到各自目标步数后，各额外运行一次完整 mini 评估；不依赖周期 validation 次数，恢复训练后也会执行。
@@ -153,7 +154,8 @@ ReSplat 原始 `config/experiment/re10k.yaml` 用 `trainer.max_steps=300_001` �
 | 项目 | Init | Refine |
 | --- | ---: | ---: |
 | `trainer.max_steps` | `66_667` | `33_334` |
-| `model.encoder.num_refine` | `0` | `2` |
+| `model.encoder.num_refine` | `0` | `1` |
+| `model.encoder.train_min_refine` / `train_max_refine` | `0` / `0` | `0` / `0` |
 | `model.encoder.latent_downsample` | `2` | `2` |
 | `model.encoder.fixed_latent_size` | `false` | `false` |
 | `model.encoder.init_gaussian_multiple` | `4` | `4` |
@@ -163,6 +165,8 @@ ReSplat 原始 `config/experiment/re10k.yaml` 用 `trainer.max_steps=300_001` �
 | 可训练参数 | Init encoder | 仅参数名包含 `encoder.update` 的 recurrent update 模块 |
 
 Refine 不是 Init 之后在同一个 Trainer 内继续累计 step，而是新建 Trainer、载入 Init checkpoint、冻结基础 encoder，再从 stage-local step 0 训练 update 模块。因此最终 checkpoint 的 Lightning `global_step` 约为 `33_334`，论文中的训练预算需要按两个阶段外部求和为 `100_001`。
+
+单轮设置由两个 OmniScene experiment 和 Refine 脚本共同指定，Init 脚本显式覆盖为 `num_refine=0`。`train_min_refine=train_max_refine=0` 禁用随机展开；现有损失、学习率和稳定性参数保持不变。历史双轮 checkpoint 不会被自动转换成单轮训练结果，复现实验时应使用其原始轮数。
 
 原项目的周期 checkpoint 每 1000 step 保存一次，而 Lightning 的 `ModelCheckpoint.on_train_end` 不会自动补存非整千的结束 step。当前分支增加了 final-checkpoint callback：Init 正常结束后固定保存 `checkpoints/final-step_66667.ckpt`，Refine 正常结束后固定保存 `checkpoints/final-step_33334.ckpt`，从而保证阶段交接和最终测试使用精确预算对应的权重，而不是误用 66,000/33,000-step 周期 checkpoint。
 
@@ -186,6 +190,8 @@ bash scripts/omniscene_view6_112x200_base_refine.sh _1
 
 后缀不修改随机种子。若要做多 seed 实验，两个阶段都显式传入同一组 `seed`、`data_loader.train.seed`；若希望固定 seed 重复，只改变后缀即可。每次完整重复仍重新完成 Init 与 Refine，合计 `100_001` 步。
 
+若只重复训练 Refine，可显式复用同一份已有 Init，不必重新训练第一阶段。当前根目录 `train.sh` 安排四个单轮实验：`base-refine_iter1_1` 至 `base-refine_iter1_4`，均加载无后缀 `base-init/checkpoints/final-step_66667.ckpt`，各自从第 0 步训练 `33_334` 步并执行最终 mini。新后缀避免与旧双轮结果混用；首次启动不继承旧 Refine 的权重、优化器或调度器，后续中断仍由队列自动恢复对应新实验。
+
 当前 Refine 脚本从第 0 步启用 `bounded_additive`、`refine_scale_delta_max=0.5`、`refine_scale_max=4.0`、`refine_update_head_fp32=true` 和 `train.refine_raw_scale_regularization_weight=0.01`。历史成功修复 run 的正则从 20,500 步后才启用，新重复实验应明确使用当前固定方案。
 
 这里的“从头训练”具体定义为：
@@ -197,7 +203,7 @@ bash scripts/omniscene_view6_112x200_base_refine.sh _1
 
 实现阶段已验证上游 RE10K 阶段配置的风险：官方 Init 配置（`latent_downsample=4`、`fixed_latent_size=true`、`init_gaussian_multiple=16`）切换到 Refine 配置后，701 个同名 encoder 状态中有 6 个尺寸冲突，涉及 `gaussian_regressor.0.weight`、`proj.weight` 和 `gaussian_head`。PyTorch 的 `strict=False` 不能忽略同名 tensor 的尺寸冲突，也不能接受跳过这些基础预测层后冻结随机参数继续训练。
 
-OmniScene 最终采用“从 Init 开始使用最终基础拓扑”的兼容方案：两个阶段都使用 `latent_downsample=2`、`fixed_latent_size=false`、`init_gaussian_multiple=4`、`refine_same_num_points=true`；Init 保持 `num_refine=0`，Refine 再改为 `num_refine=2`。实测 Init 与 Refine 的 701 个同名基础状态全部尺寸兼容，Refine 仅新增 141 个 `encoder.update*` 状态。加载门禁允许且只允许这些 update 状态缺失，并拒绝基础状态缺失、unexpected keys 或任何同名尺寸冲突。
+OmniScene 最终采用“从 Init 开始使用最终基础拓扑”的兼容方案：两个阶段都使用 `latent_downsample=2`、`fixed_latent_size=false`、`init_gaussian_multiple=4`、`refine_same_num_points=true`；Init 保持 `num_refine=0`，Refine 默认为 `num_refine=1`。正数轮数共享相同的 update 网络，不改变参数形状。此前实测 Init 与 Refine 的 701 个同名基础状态全部尺寸兼容，Refine 仅新增 141 个 `encoder.update*` 状态。加载门禁允许且只允许这些 update 状态缺失，并拒绝基础状态缺失、unexpected keys 或任何同名尺寸冲突。
 
 在单张 24 GB GPU 上，六视图 Refine 的 recurrent point transformer 需要启用 `recurrent_use_checkpointing=true`。该设置仅用反向重计算换取更低的激活显存，不改变模型参数、前向结果、损失、batch size 或 optimizer step 口径。原发布代码的这一分支漏传 `knn_idx`，实现阶段已修复为向 checkpoint 显式传入当前 transformer block 和缓存的 KNN 索引，避免闭包在反向重计算时引用错误 block。
 
@@ -327,7 +333,7 @@ CUDA_VISIBLE_DEVICES=<gpu> python -m src.main +experiment=omniscene_112x200 \
     model.encoder.latent_downsample=2 \
     model.encoder.fixed_latent_size=false \
     model.encoder.init_gaussian_multiple=4 \
-    model.encoder.num_refine=2 \
+    model.encoder.num_refine=1 \
     model.encoder.refine_same_num_points=true \
     model.encoder.recurrent_use_checkpointing=true \
     model.encoder.refine_scale_update_mode=bounded_additive \
@@ -361,7 +367,7 @@ CUDA_VISIBLE_DEVICES=<gpu> python -m src.main +experiment=omniscene_112x200 \
     model.encoder.latent_downsample=2 \
     model.encoder.fixed_latent_size=false \
     model.encoder.init_gaussian_multiple=4 \
-    model.encoder.num_refine=2 \
+    model.encoder.num_refine=1 \
     model.encoder.refine_same_num_points=true \
     checkpointing.pretrained_model=<refine_checkpoint> \
     model.encoder.refine_scale_update_mode=bounded_additive \
