@@ -132,6 +132,7 @@ class TrainCfg:
     print_log_every_n_steps: int
     eval_model_every_n_val: int
     eval_final_mini: bool
+    final_mini_only: bool
     eval_data_length: int
     eval_deterministic: bool
     eval_time_skip_steps: int
@@ -1940,13 +1941,19 @@ class ModelWrapper(LightningModule):
                 self.run_full_test_sets_eval()
 
     @rank_zero_only
-    def run_full_test_sets_eval(self, final_output_dir: Path | None = None) -> None:
+    def run_full_test_sets_eval(
+        self, final_output_dir: Path | None = None, *,
+        eval_data_module=None, eval_step: int | None = None, eval_logger=None,
+    ) -> None:
         start_t = time.time()
+        step = self.global_step if eval_step is None else eval_step
+        data_module = self.trainer.datamodule if eval_data_module is None else eval_data_module
+        metric_logger = self.logger if eval_data_module is None else eval_logger
 
         pred_depths = None
         depth_gt = None
 
-        full_testsets = self.trainer.datamodule.test_dataloader(
+        full_testsets = data_module.test_dataloader(
             dataset_cfg=self.eval_data_cfg
         )
         # Final evaluation always covers the entire mini split, even when a
@@ -2018,7 +2025,7 @@ class ModelWrapper(LightningModule):
 
                         curr_gaussians = self.encoder(
                             curr_window_input,
-                            self.global_step,
+                            step,
                             deterministic=False,
                         )
 
@@ -2085,7 +2092,7 @@ class ModelWrapper(LightningModule):
                 else:
                     gaussians_probabilistic = self.encoder(
                         batch["context"],
-                        self.global_step,
+                        step,
                         deterministic=False,
                     )
 
@@ -2131,7 +2138,7 @@ class ModelWrapper(LightningModule):
             if self.train_cfg.eval_deterministic:
                 gaussians_deterministic = self.encoder(
                     batch["context"],
-                    self.global_step,
+                    step,
                     deterministic=True,
                 )
                 output_deterministic = self.decoder.forward(
@@ -2227,7 +2234,7 @@ class ModelWrapper(LightningModule):
             self.log_dict(logged_scores)
         else:
             checkpoint = get_final_checkpoint_path(
-                Path(get_cfg()["output_dir"]) / "checkpoints", self.global_step
+                Path(get_cfg()["output_dir"]) / "checkpoints", step
             )
             summary = save_final_mini_scores(
                 final_output_dir / "metrics",
@@ -2235,7 +2242,7 @@ class ModelWrapper(LightningModule):
                 len(full_testsets.dataset),
                 {
                     "checkpoint": str(checkpoint.resolve()),
-                    "global_step": self.global_step,
+                    "global_step": step,
                     "num_refine": self.encoder.cfg.num_refine,
                     "target_views": v if scene_names else 0,
                     "scenes": scene_names,
@@ -2247,11 +2254,11 @@ class ModelWrapper(LightningModule):
             # keep a separate namespace to distinguish them from periodic tests.
             logged_scores.update({f"test/{name}": value for name, value in summary.items()})
             logged_scores.update({f"final_mini/{name}": value for name, value in summary.items()})
-            logged_scores["final_mini/global_step"] = self.global_step
+            logged_scores["final_mini/global_step"] = step
             logged_scores["final_mini/sample_count"] = len(full_testsets.dataset)
-            if self.logger is not None:
-                self.logger.log_metrics(logged_scores, step=self.global_step)
-            print(f"Final mini scores (step {self.global_step}): {summary}")
+            if metric_logger is not None:
+                metric_logger.log_metrics(logged_scores, step=step)
+            print(f"Final mini scores (step {step}): {summary}")
             print(f"Saved final mini results to {final_output_dir / 'metrics'}")
 
     @rank_zero_only

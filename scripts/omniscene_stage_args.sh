@@ -56,7 +56,7 @@ for omniscene_arg in "${omniscene_overrides[@]}"; do
     esac
 done
 if [[ "$omniscene_config_only" == false ]]; then
-    if [[ "$omniscene_resume" != true && "$omniscene_load" == null && -d "$omniscene_output_dir" && -n "$(ls -A "$omniscene_output_dir")" ]]; then
+    if [[ "${RESPLAT_QUEUE_MANAGED:-0}" != 1 && "$omniscene_resume" != true && "$omniscene_load" == null && -d "$omniscene_output_dir" && -n "$(ls -A "$omniscene_output_dir")" ]]; then
         echo "Output already exists: $omniscene_output_dir. Use a new suffix or explicit checkpoint restoration." >&2
         exit 2
     fi

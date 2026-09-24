@@ -32,12 +32,13 @@ with install_import_hook(
     from src.misc.LocalLogger import LocalLogger
     from src.misc.final_checkpoint import FinalCheckpoint
     from src.misc.step_tracker import StepTracker
-    from src.misc.wandb_tools import update_checkpoint_path
+    from src.misc.wandb_tools import get_wandb_resume_kwargs, update_checkpoint_path
     from src.misc.resume_ckpt import find_latest_ckpt, no_resume_upsampler
     from src.misc.checkpoint_loading import load_state_dict_with_shape_check
     from src.model.decoder import get_decoder
     from src.model.encoder import get_encoder
     from src.model.model_wrapper import ModelWrapper
+    from src.evaluation.final_mini import evaluate_saved_final_mini
 
 
 def cyan(text: str) -> str:
@@ -50,6 +51,11 @@ def cyan(text: str) -> str:
     config_name="main",
 )
 def train(cfg_dict: DictConfig):
+    if cfg_dict.train.final_mini_only and (
+        cfg_dict.mode != "train" or not cfg_dict.train.eval_final_mini
+        or cfg_dict.checkpointing.load is None or cfg_dict.checkpointing.resume
+    ):
+        raise ValueError("final_mini_only requires mode=train, eval_final_mini=true and a local checkpointing.load (resume=false)")
     if cfg_dict.train.eval_final_mini and cfg_dict.dataset.name != "omniscene":
         raise ValueError("train.eval_final_mini requires dataset=omniscene")
     if cfg_dict["mode"] == "train" and (
@@ -135,10 +141,7 @@ def train(cfg_dict: DictConfig):
     # Set up logging with wandb.
     callbacks = []
     if cfg_dict.wandb.mode != "disabled" and cfg.mode == "train":
-        wandb_extra_kwargs = {}
-        if cfg_dict.wandb.id is not None:
-            wandb_extra_kwargs.update({'id': cfg_dict.wandb.id,
-                                       'resume': "must"})
+        wandb_extra_kwargs = get_wandb_resume_kwargs(cfg.wandb)
         run_name = os.path.basename(cfg_dict.output_dir)
         if cfg_dict.log_slurm_id:
             run_name += f" ({os.environ.get('SLURM_JOB_ID')})"
@@ -232,6 +235,13 @@ def train(cfg_dict: DictConfig):
         step_tracker,
         global_rank=trainer.global_rank,
     )
+
+    if cfg.train.final_mini_only:
+        evaluate_saved_final_mini(
+            model_wrapper, data_module, checkpoint_path,
+            cfg.trainer.max_steps, output_dir, logger,
+        )
+        return
 
     if cfg.mode == "train":
         print("train:", len(data_module.train_dataloader()))

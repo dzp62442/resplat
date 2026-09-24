@@ -5,6 +5,37 @@ import math
 from pathlib import Path
 
 
+def evaluate_saved_final_mini(model, data_module, checkpoint: Path, max_steps: int,
+                             output_dir: Path, logger=None, device="cuda") -> None:
+    """Reuse the exact end-of-stage metric path without a fit/optimizer step."""
+    import torch
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if payload.get("global_step") != max_steps or max_steps <= 0:
+        raise ValueError("Final mini recovery requires the exact final-step checkpoint")
+    expected = output_dir / "checkpoints" / f"final-step_{max_steps}.ckpt"
+    if checkpoint.resolve() != expected.resolve():
+        # The process may have exited between the last periodic save and the
+        # final callback. Promote the exact completed state, never train again.
+        if checkpoint.parent.resolve() not in (
+            (output_dir / "checkpoints").resolve(), (output_dir / "checkpoints_backups").resolve()
+        ):
+            raise ValueError("Final mini recovery must use this stage's checkpoint")
+        expected.parent.mkdir(parents=True, exist_ok=True)
+        temporary = expected.with_suffix(".ckpt.tmp")
+        torch.save({key: value for key, value in payload.items()
+                    if key not in ("optimizer_states", "lr_schedulers")}, temporary)
+        temporary.replace(expected)
+    model.load_state_dict(payload["state_dict"], strict=True)
+    del payload
+    model.to(device).eval()
+    with torch.inference_mode():
+        model.run_full_test_sets_eval(
+            final_output_dir=output_dir / f"mini-final-step_{max_steps}",
+            eval_data_module=data_module, eval_step=max_steps, eval_logger=logger,
+        )
+
+
 def save_final_mini_scores(
     output_dir: Path,
     scores: dict[str, list[float]],

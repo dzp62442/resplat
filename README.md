@@ -1,107 +1,25 @@
-# 在 OmniScene 数据集上与 SVF-GS 进行对比
+# OmniScene 对比实验
 
-数据组织、实验口径与实现细节见
-[`docs/OmniScene 数据集实验文档.md`](docs/OmniScene%20数据集实验文档.md)。
-两种分辨率都采用 Init `66,667` steps + Refine `33,334` steps，总计
-`100,001` optimizer steps；训练损失启用动态物体掩码。
-两个阶段正常完成后都会自动评估完整 mini（2,048 个样本、18 个 target
-views），并把最终 PSNR、SSIM、LPIPS、PCC 写入该阶段的 W&B 记录和本地 JSON。
+Init 66,667 步 + Refine 33,334 步；W&B 默认离线，两阶段结束后自动评估 mini。
 
-## 训练
-
-### 112x200
+在根目录 `train.sh` 中逐条填写训练指令，例如 112×200：
 
 ```bash
-# 第一阶段：从头训练 Init
-bash scripts/omniscene_view6_112x200_base_init.sh
-
-# 第一阶段完成后启动 Refine
-bash scripts/omniscene_view6_112x200_base_refine.sh \
-    checkpoints/resplat/omniscene-view6-112x200/base-init/checkpoints/final-step_66667.ckpt
-```
-
-### 224x400
-
-```bash
-# 第一阶段：从头训练 Init
-bash scripts/omniscene_view6_224x400_base_init.sh
-
-# 第一阶段完成后启动 Refine
-bash scripts/omniscene_view6_224x400_base_refine.sh \
-    checkpoints/resplat/omniscene-view6-224x400/base-init/checkpoints/final-step_66667.ckpt
-```
-
-### 重复实验与阶段结束评估
-
-同一次实验的两个阶段使用同一个后缀。Refine 不传 checkpoint 时，自动加载
-同分辨率、同后缀 Init 的 `final-step_66667.ckpt`。例如 `_1`：
-
-```bash
-conda activate resplat
-bash scripts/omniscene_view6_112x200_base_init.sh _1 && \
+bash scripts/omniscene_view6_112x200_base_init.sh _1
 bash scripts/omniscene_view6_112x200_base_refine.sh _1
 ```
 
-Init 的训练和最终 mini 评估都成功后才会启动 Refine。重复下一次时把两处 `_1`
-换为 `_2`；224x400 使用对应分辨率的脚本。输出目录分别为
-`checkpoints/resplat/omniscene-view6-112x200/base-init_1` 和 `base-refine_1`，
-W&B run 名称也分别为 `base-init_1`、`base-refine_1`。已存在的非空目录会拒绝
-新训练，防止覆盖旧实验。
+224×400 使用对应分辨率的脚本；重复实验将两个阶段的后缀都改为 `_2` 等。
 
-后缀只区分实验，不自动改变 seed；如需多种子实验，可在两阶段命令后追加
-相同的 `seed=111124 data_loader.train.seed=1235`。其他 Hydra `key=value`
-参数也支持透传；仍兼容 `refine.sh <init.ckpt> [_suffix]` 的显式权重用法。
-
-最终 mini 与每 10 次 validation 的周期 mini 独立。结果分别保存在：
-
-```text
-base-init_1/mini-final-step_66667/metrics/scores_all_avg.json
-base-refine_1/mini-final-step_33334/metrics/scores_all_avg.json
-```
-
-同目录的 `scores_{psnr,ssim,lpips,pcc}_all.json` 保存逐样本分数，
-`evaluation.json` 记录最终 checkpoint、step、split、样本数量和场景列表。
-W&B 的 `final_mini/*` 明确标识最终结果，`test/*` 也更新为最终结果。
-暂停、报错或诊断保护提前停止不会触发最终 mini；断点恢复后正常到达目标步数才会触发。
-
-Refine 脚本包含当前全部稳定性配置，新重复实验会从 Refine 第 0 步启用
-有界尺度更新和 raw scale 正则（历史修复实验是在中途加入正则）。
-
-## 完整测试
-
-主表使用完整的官方 OmniScene test split，不使用 Center150。
-
-### 112x200
+启动或中断后恢复（不要直接执行 `bash train.sh`）：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=omniscene_112x200 \
-    mode=test \
-    dataset.test_split=total \
-    model.encoder.num_refine=2 \
-    model.encoder.refine_scale_update_mode=bounded_additive \
-    model.encoder.refine_scale_delta_max=0.5 \
-    model.encoder.refine_scale_max=4.0 \
-    model.encoder.refine_update_head_fp32=true \
-    checkpointing.pretrained_model=checkpoints/resplat/omniscene-view6-112x200/base-refine/checkpoints/final-step_33334.ckpt \
-    test.compute_scores=true \
-    output_dir=outputs/resplat-omniscene-112x200-base-refine-total
+python scripts/train_queue.py --dry-run  # 查看计划
+python scripts/train_queue.py            # 启动或恢复
 ```
 
-### 224x400
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=omniscene_224x400 \
-    mode=test \
-    dataset.test_split=total \
-    model.encoder.num_refine=2 \
-    model.encoder.refine_scale_update_mode=bounded_additive \
-    model.encoder.refine_scale_delta_max=0.5 \
-    model.encoder.refine_scale_max=4.0 \
-    model.encoder.refine_update_head_fp32=true \
-    checkpointing.pretrained_model=checkpoints/resplat/omniscene-view6-224x400/base-refine/checkpoints/final-step_33334.ckpt \
-    test.compute_scores=true \
-    output_dir=outputs/resplat-omniscene-224x400-base-refine-total
-```
+队列自动跳过已完成阶段、续训未完成阶段，并补跑缺失的最终 mini。
+配置说明与完整 test 命令见[实验文档](docs/OmniScene%20数据集实验文档.md)。
 
 ---
 
@@ -198,7 +116,7 @@ ReSplat is trained in two stages: (1) initial Gaussian prediction and (2) recurr
 
 The training scripts in [scripts/](scripts) contain the exact commands and hyperparameters used for the experiments in our paper. Please refer to them for detailed configurations.
 
-Before training, you need to download the pre-trained [depth model](MODEL_ZOO.md), and set up your [wandb account](config/main.yaml) (in particular, by setting `wandb.entity=YOUR_ACCOUNT`) for logging.
+Before training, download the pre-trained [depth model](MODEL_ZOO.md). W&B logging is offline by default; a [wandb account](config/main.yaml) is only needed for manually syncing logs or explicitly enabling `wandb.mode=online`.
 
 ## Citation
 

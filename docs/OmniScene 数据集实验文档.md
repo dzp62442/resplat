@@ -42,6 +42,37 @@
 
 Hydra 的加载顺序保持不变：先加载 `config/main.yaml`，再由 `+experiment=omniscene_*` 覆盖数据集、模型、损失与实验参数，最后由脚本中的命令行参数覆盖阶段专属参数。不能只看 `config/main.yaml` 的默认值判断最终实验配置。
 
+W&B 在公共 `config/main.yaml` 中默认设为 `wandb.mode=offline`，两种分辨率、两个阶段均继承该值。训练期间只写各阶段输出目录下的 `wandb/offline-run-*`，不会自动连接云端或上传；最终 mini 的本地 JSON 不受影响。需要上传时手动执行 `wandb sync <具体的 offline-run 目录>`。离线模式不使用云端 `resume`，模型与优化器仍由本地 checkpoint 恢复；`wandb://` 权重路径会立即报错，需先单独下载为本地文件。
+
+### 训练队列与中断恢复
+
+根目录 `train.sh` 只记录各次实验、各阶段的训练指令，执行入口为
+`python scripts/train_queue.py`；`--dry-run` 只读核验并打印计划。
+命令可以是四种 OmniScene 阶段脚本，也可以是 `python -m src.main ...`。
+队列在项目根目录执行，并用阶段脚本的 `--cfg job --resolve` 获取最终配置。
+
+| 状态 | 调度行为 |
+| --- | --- |
+| 尚无检查点 | 从头训练，保留已有启动日志 |
+| 训练未完成 | 恢复最近有效完整 checkpoint 的模型、optimizer、scheduler、step 和 validation 计数 |
+| 已到达目标步数，但 mini 不完整 | 使用最终权重只补 mini，不调用 `Trainer.fit` |
+| 最终权重及 mini 完整 | 跳过，进入下一条指令 |
+
+检查点必须可读取且内部 step 与文件名一致。自动续训排除仅含权重的
+`final-step_*.ckpt`，最新周期检查点损坏时回退到之前有效的周期或备份检查点。
+如果没有可恢复的完整状态，不静默重训覆盖。若最后一次周期检查点恰好达到目标
+step，但来不及执行 final callback，先由它恢复最终权重文件，再只补 mini。
+
+完成判据不仅是文件存在：核验 checkpoint、mini split、最终 step、refine 次数、
+18 个 target views、完整 mini 场景顺序，以及四组有限逐样本指标和均值。
+每个输出目录保存 `queue_config.yaml`；再次调度时核验模型、训练参数、数据与随机种子，
+配置冲突要求使用新后缀，不自动覆盖。旧实验可从本地 W&B 配置或最终 mini 配置核验。
+
+Ctrl-C/SIGTERM 停止当前命令及其子进程并退出队列；下次执行同一队列自动恢复。
+恢复点是最近完整保存点，不保证包含停止前尚未保存的更新，也不保证重现 epoch 内
+完全相同的数据采样顺序。默认最多额外重试 3 次普通异常；诊断保护的正常提前退出
+不会反复重试。已完成评估后后台退出等待上限默认为 300 秒。
+
 ### 数据集基础配置
 
 `config/dataset/omniscene.yaml` 采用以下核心值：

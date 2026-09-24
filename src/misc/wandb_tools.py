@@ -3,6 +3,18 @@ from pathlib import Path
 import wandb
 
 
+def get_wandb_resume_kwargs(wandb_cfg: dict) -> dict:
+    kwargs = {}
+    if wandb_cfg.get("id") is not None:
+        kwargs["id"] = wandb_cfg["id"]
+        kwargs["resume"] = "must"
+    if wandb_cfg.get("mode") == "offline":
+        # Offline runs create local log segments, not server-side resumes.
+        # Override Lightning's default resume="allow" as well.
+        kwargs["resume"] = None
+    return kwargs
+
+
 def version_to_int(artifact) -> int:
     """Convert versions of the form vX to X. For example, v12 to 12."""
     return int(artifact.version[1:])
@@ -45,6 +57,12 @@ def update_checkpoint_path(path: str | None, wandb_cfg: dict) -> Path | None:
 
     if not str(path).startswith("wandb://"):
         return Path(path)
+
+    if wandb_cfg.get("mode") == "offline":
+        raise ValueError(
+            "wandb.mode=offline cannot download a wandb:// checkpoint. "
+            "Download it separately and set checkpointing.load to a local .ckpt path."
+        )
 
     run_id, *version = path[len("wandb://") :].split(":")
     if len(version) == 0:

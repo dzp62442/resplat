@@ -185,6 +185,20 @@ class TestOmniSceneRuns(unittest.TestCase):
                     logged = logger.log_metrics.call_args.args[0]
                     self.assertAlmostEqual(logged["final_mini/pcc"], 1.0)
                     self.assertEqual(logged["test/psnr"], logged["final_mini/psnr"])
+                    # Queue-only recovery must use the same loop without an
+                    # attached Trainer and preserve the saved global step.
+                    data_module = wrapper._trainer.datamodule
+                    wrapper._trainer = None
+                    with patch("src.model.model_wrapper.compute_lpips", return_value=torch.tensor([0.1])), patch(
+                        "src.model.model_wrapper.compute_ssim", return_value=torch.tensor([0.8])
+                    ):
+                        wrapper.run_full_test_sets_eval(
+                            final_output_dir=out, eval_data_module=data_module,
+                            eval_step=33334, eval_logger=logger,
+                        )
+                    recovered = json.loads((out / "metrics/scores_psnr_all.json").read_text())
+                    self.assertEqual(recovered, scores)
+                    self.assertEqual(logger.log_metrics.call_args.kwargs["step"], 33334)
         finally:
             set_cfg(previous_cfg)
 

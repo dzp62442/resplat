@@ -9,7 +9,8 @@ wandb:
   project: resplat
   entity: dzp62442-DROPS
   name: placeholder
-  mode: online
+  # Keep training independent of W&B connectivity; upload logs manually later.
+  mode: offline
   id: null
 
 mode: train
@@ -59,6 +60,8 @@ train:
   print_log_every_n_steps: 100
   eval_model_every_n_val: 2
   eval_final_mini: false
+  # Queue recovery: evaluate an already finished stage without training again.
+  final_mini_only: false
   eval_data_length: 999999
   eval_deterministic: false
   eval_time_skip_steps: 3
